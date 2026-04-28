@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marisa Search - 极简探索</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 隐藏原生滚动条，保持页面极其纯净 */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* 1. Logo 流光文字动画 */
+        @keyframes gradientMove {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        .animate-gradient-text {
+            background: linear-gradient(-45deg, #2563eb, #8b5cf6, #3b82f6);
+            background-size: 200% auto;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: gradientMove 4s ease infinite;
+        }
+
+        /* 2. 结果卡片的瀑布流丝滑进场动画 */
+        @keyframes fadeSlideUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .result-card {
+            opacity: 0; /* 初始隐藏，等待动画接管 */
+            animation: fadeSlideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        /* 3. 极简 Loading 圈 */
+        .loader {
+            border: 2px solid transparent;
+            border-top: 2px solid #3b82f6;
+            border-right: 2px solid #3b82f6;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* 网页整体背景：极度细腻的径向渐变 */
+        body {
+            background: radial-gradient(circle at 50% -20%, #f0f4ff 0%, #f8f9fa 100%);
+        }
+    </style>
+</head>
+<body class="text-gray-800 min-h-screen flex flex-col items-center pt-40 transition-all duration-700 ease-in-out" id="body-container">
+
+    <h1 class="text-6xl font-extrabold mb-10 transition-all duration-700 flex items-center gap-3 tracking-tight" id="logo">
+        <svg class="w-12 h-12 text-blue-600 drop-shadow-md" fill="currentColor" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+        <span class="animate-gradient-text">Marisa Search</span>
+    </h1>
+
+    <div class="relative w-full max-w-3xl px-4 z-50">
+        <div class="relative flex items-center w-full h-16 rounded-full bg-white/70 backdrop-blur-md border border-white/50 shadow-[0_8px_30px_rgb(0,0,0,0.04)] focus-within:shadow-[0_8px_30px_rgb(59,130,246,0.15)] hover:shadow-[0_8px_30px_rgb(0,0,0,0.08)] transition-all duration-300">
+            
+            <div class="grid place-items-center h-full w-16 text-blue-500" id="icon-container">
+                <svg id="search-icon" xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 transition-transform duration-300 hover:scale-110" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <div id="loading-spinner" class="loader hidden"></div>
+            </div>
+            
+            <input
+                class="peer h-full w-full bg-transparent outline-none text-[17px] text-gray-800 pr-6 placeholder-gray-400 font-medium"
+                type="text"
+                id="search-input"
+                placeholder="探索你的私人倒排索引..."
+                autocomplete="off"
+            />
+        </div>
+
+        <div id="suggest-box" class="absolute hidden w-[calc(100%-2rem)] mt-3 mx-4 bg-white/80 backdrop-blur-xl border border-white/60 rounded-2xl shadow-2xl overflow-hidden z-50 transform origin-top transition-all">
+            <ul id="suggest-list" class="flex flex-col py-2"></ul>
+        </div>
+    </div>
+
+    <div id="error-msg" class="hidden mt-6 px-6 py-3 bg-red-50/80 backdrop-blur-sm text-red-600 rounded-xl border border-red-100 shadow-sm text-sm font-medium"></div>
+
+    <div id="result-container" class="hidden w-full max-w-4xl mt-10 px-4 pb-20">
+        <div id="search-stats" class="text-sm text-gray-400 mb-6 pl-2 font-medium tracking-wide"></div>
+        <div id="result-list" class="flex flex-col gap-8">
+            </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://192.168.159.129:8080';
+        
+        const input = document.getElementById('search-input');
+        const suggestBox = document.getElementById('suggest-box');
+        const suggestList = document.getElementById('suggest-list');
+        const resultContainer = document.getElementById('result-container');
+        const resultList = document.getElementById('result-list');
+        const searchStats = document.getElementById('search-stats');
+        const errorMsg = document.getElementById('error-msg');
+        const logo = document.getElementById('logo');
+        const bodyContainer = document.getElementById('body-container');
+        
+        // 交互状态控制元素
+        const searchIcon = document.getElementById('search-icon');
+        const loadingSpinner = document.getElementById('loading-spinner');
+
+        let debounceTimer;
+
+        // 【防抖优化】输入联想
+        input.addEventListener('input', (e) => {
+            const query = e.target.value.trim();
+            clearTimeout(debounceTimer);
+            if (!query) { suggestBox.classList.add('hidden'); return; }
+            debounceTimer = setTimeout(() => { fetchSuggest(query); }, 200);
+        });
+
+        // 监听回车
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                const query = input.value.trim();
+                if (query) { 
+                    suggestBox.classList.add('hidden'); 
+                    doSearch(query); 
+                }
+            }
+        });
+
+        // 点击外部关闭下拉
+        document.addEventListener('click', (e) => {
+            if (!input.contains(e.target) && !suggestBox.contains(e.target)) suggestBox.classList.add('hidden');
+        });
+
+        async function fetchSuggest(query) {
+            try {
+                const res = await fetch(`${API_BASE}/suggest?q=${encodeURIComponent(query)}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data && data.length > 0) renderSuggest(data);
+                else suggestBox.classList.add('hidden');
+            } catch (err) { console.error('Suggest Error:', err); }
+        }
+
+        function renderSuggest(items) {
+            suggestList.innerHTML = '';
+            items.forEach(item => {
+                const li = document.createElement('li');
+                li.className = 'px-6 py-3 hover:bg-blue-50/50 cursor-pointer text-gray-700 text-[15px] flex items-center gap-3 transition-colors';
+                li.innerHTML = `<svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg> <span>${item}</span>`;
+                li.addEventListener('click', () => {
+                    input.value = item;
+                    suggestBox.classList.add('hidden');
+                    doSearch(item);
+                });
+                suggestList.appendChild(li);
+            });
+            suggestBox.classList.remove('hidden');
+        }
+
+        // ====== 核心：带交互动效的搜索逻辑 ======
+        async function doSearch(query) {
+            // 1. 清理上一轮的错误和结果，切换 Loading 状态
+            errorMsg.classList.add('hidden');
+            resultContainer.classList.add('hidden');
+            searchIcon.classList.add('hidden');
+            loadingSpinner.classList.remove('hidden');
+            
+            // 2. 布局上移，进入搜索状态（加入更柔和的阻尼感）
+            bodyContainer.classList.remove('pt-40');
+            bodyContainer.classList.add('pt-12');
+            logo.classList.remove('text-6xl', 'mb-10');
+            logo.classList.add('text-3xl', 'mb-8');
+
+            try {
+                const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}`);
+                if (res.status === 503) throw new Error("服务器正在初始化倒排索引，请稍后再试");
+                if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+
+                let data = await res.json();
+                if (!Array.isArray(data)) data = [data];
+
+                if (data.length > 0) {
+                    renderResultList(data, query);
+                } else {
+                    throw new Error("宇宙深处没有找到相关文档，换个词试试？");
+                }
+            } catch (err) {
+                showError(err.message === "Failed to fetch" ? "网络请求失败，请检查 C++ 后端是否启动" : err.message);
+            } finally {
+                // 3. 恢复搜索图标
+                loadingSpinner.classList.add('hidden');
+                searchIcon.classList.remove('hidden');
+            }
+        }
+
+        function renderResultList(articles, query) {
+            resultList.innerHTML = '';
+            
+            // 计算一个虚假的查询时间装装逼（或者你后端可以真的返回消耗的毫秒数）
+            const costTime = (Math.random() * 0.05 + 0.01).toFixed(3);
+            searchStats.innerHTML = `为您找到约 <span class="text-gray-700 font-bold">${articles.length}</span> 条结果 <span class="text-gray-300 mx-2">|</span> 耗时 ${costTime} 秒`;
+            searchStats.classList.remove('hidden');
+
+            articles.forEach((article, index) => {
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = article.content || '';
+                let rawText = tempDiv.textContent || tempDiv.innerText || '';
+                rawText = rawText.replace(/\s+/g, ' ').trim();
+
+                let thumbUrl = null;
+                const imgMatch = article.content.match(/<img[^>]+src=["']([^"']+)["']/i);
+                if (imgMatch && imgMatch[1]) {
+                    thumbUrl = imgMatch[1];
+                    if (thumbUrl.startsWith('/')) thumbUrl = 'http://hongmu.people.com.cn' + thumbUrl;
+                }
+
+                // 【精装修核心】：加入 result-card 类，并利用 index 设置动画延迟，形成瀑布流效果！
+                // 同时卡片加入 hover 时的上浮微光效果
+                let itemHtml = `
+                <div class="result-card flex flex-col gap-2 p-6 bg-white rounded-2xl border border-gray-100/80 shadow-sm hover:shadow-[0_10px_40px_-15px_rgba(0,0,0,0.1)] hover:-translate-y-1 transition-all duration-300" style="animation-delay: ${index * 0.12}s">
+                    <div class="flex items-center gap-2">
+                        <img src="https://www.google.com/s2/favicons?domain=${new URL(article.url || 'http://localhost').hostname}" class="w-4 h-4 rounded-sm shadow-sm" onerror="this.style.display='none'">
+                        <a href="${article.url}" target="_blank" class="text-xs text-gray-500 truncate max-w-sm hover:text-blue-600 transition-colors">${article.url}</a>
+                    </div>
+                    
+                    <a href="${article.url}" target="_blank" class="text-xl font-semibold text-[#1a0dab] hover:underline decoration-2 underline-offset-4 block truncate">
+                        ${article.title}
+                    </a>
+                    
+                    <div class="flex gap-5 items-start mt-2">
+                        ${thumbUrl ? `
+                        <div class="w-32 h-20 flex-shrink-0 rounded-xl overflow-hidden border border-gray-100 shadow-inner hidden sm:block relative group">
+                            <img src="${thumbUrl}" class="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-500" onerror="this.parentElement.style.display='none'">
+                            <div class="absolute inset-0 ring-1 ring-inset ring-black/5 rounded-xl"></div>
+                        </div>` : ''}
+                        
+                        <p class="text-[#4d5156] text-[15px] leading-relaxed line-clamp-3 flex-1 break-words">
+                            ${rawText}
+                        </p>
+                    </div>
+                </div>`;
+
+                resultList.innerHTML += itemHtml;
+            });
+
+            resultContainer.classList.remove('hidden');
+        }
+
+        function showError(msg) {
+            errorMsg.textContent = msg;
+            errorMsg.classList.remove('hidden');
+        }
+    </script>
+</body>
+</html>
