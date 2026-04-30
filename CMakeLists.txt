@@ -36,16 +36,17 @@ include_directories(
 set(SRCS
     ${PROJECT_SOURCE_DIR}/src/Acceptor.cpp
     ${PROJECT_SOURCE_DIR}/src/Configer.cpp
+    ${PROJECT_SOURCE_DIR}/src/DictProducer.cpp       # jieba 词典加载 + 编辑距离匹配（降准匹配层）
     ${PROJECT_SOURCE_DIR}/src/DirScanner.cpp
     ${PROJECT_SOURCE_DIR}/src/EventLoop.cpp
     ${PROJECT_SOURCE_DIR}/src/EventLoopGroup.cpp
     ${PROJECT_SOURCE_DIR}/src/FileProcessor.cpp
     ${PROJECT_SOURCE_DIR}/src/InetAddress.cpp
-    ${PROJECT_SOURCE_DIR}/src/InferEngine.cpp       # BERT 推理引擎（原 headonly 拆分）
+    ${PROJECT_SOURCE_DIR}/src/InferEngine.cpp        # BERT 推理引擎
     ${PROJECT_SOURCE_DIR}/src/main.cpp
     ${PROJECT_SOURCE_DIR}/src/mylog.cpp
     ${PROJECT_SOURCE_DIR}/src/PageLib.cpp
-    ${PROJECT_SOURCE_DIR}/src/SemanticIndexer.cpp   # 语义搜索引擎（原 headonly 拆分）
+    ${PROJECT_SOURCE_DIR}/src/SemanticIndexer.cpp    # 语义搜索引擎（含 jieba+BGE 融合 suggest）
     ${PROJECT_SOURCE_DIR}/src/Socket.cpp
     ${PROJECT_SOURCE_DIR}/src/SockIO.cpp
     ${PROJECT_SOURCE_DIR}/src/Task.cpp

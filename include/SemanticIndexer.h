@@ -39,13 +39,15 @@
  * @endcode
  *
  * 依赖：
- *   - InferEngine.hpp（内含 WordPieceTokenizer.hpp）
+ *   - InferEngine.h（BERT 推理引擎）
+ *   - DictProducer.h（jieba 词典编辑距离匹配）
  *   - tinyxml2（解析 XML 文档库）
  *   - sqlite3（嵌入式数据库，C API）
  *   - Configer（读取配置文件）
  */
 
 #include "InferEngine.h"
+#include "DictProducer.h"
 #include "Configer.h"
 #include "sqlite3.h"
 #include <tinyxml2.h>
@@ -189,23 +191,34 @@ public:
     json find(const string& query, int topK = 10);
 
     /**
-     * @brief 词语推荐（基于 BERT 语义相似度）
+     * @brief 词语推荐（jieba 50% + BGE 50% 综合评分）
      * @param query  用户输入的部分查询（UTF-8）
-     * @param topK   返回前 K 个推荐词（默认 5）
+     * @param topK   返回前 K 个推荐词（默认 10）
      * @return json  推荐词语数组（JSON 字符串数组）
      *
-     * 实现原理：
-     *   1. 用 BERT 对输入编码为 512 维向量
-     *   2. 从 SQLite 读取所有文档标题
-     *   3. 计算向量点积，找到语义最相似的文档标题
-     *   4. 返回 TopK 标题作为推荐词
+     * 实现原理（双引擎融合）：
+     *   1. jieba 引擎（50%）：遍历词典，Levenshtein 编辑距离 → 相似度 score_j
+     *   2. BGE 引擎（50%）：BERT 编码 → SQLite title_embedding ANN → 语义词提取 → score_b
+     *   3. 综合评分 = 0.5 × score_j + 0.5 × score_b
+     *   4. 按综合评分排序，返回 topK
      *
-     * 相比旧版（DictProducer::find() 基于 jieba 词典编辑距离）：
-     *   - BERT 能理解同义词和上下文
-     *   - 推荐词来自实际文档标题，而非词典
-     *   - 即使输入有错别字也能找到语义相近的结果
+     * 设计思路：
+     *   - jieba：保证词汇级别的"长得像"（纠错、补全）
+     *   - BGE：保证语义级别的"意思像"（同义词、相关概念）
+     *   - 50/50 平衡，避免纯语义推荐太泛或纯编辑距离太死板
      */
-    json suggest(const string& query, int topK = 5);
+    json suggest(const string& query, int topK = 10);
+
+    /**
+     * @brief jieba 降准匹配（编辑距离模糊匹配）
+     * @param query  查询字符串
+     * @param topK   返回前 K 个
+     * @return json  模糊匹配的词数组（JSON 字符串数组）
+     *
+     * 用于 /search 端点的"您是不是想找"提示。
+     * 底层调用 DictProducer::find()，基于 Levenshtein 编辑距离。
+     */
+    json jiebaSuggest(const string& query, int topK = 5) const;
 
     /// 获取向量维度
     size_t dim() const { return engine_.dim(); }
@@ -252,10 +265,11 @@ private:
     // 成员变量
     // ============================================================
 
-    BertInferEngine engine_;    ///< BERT 推理引擎（封装 ONNX Runtime）
-    Configer& _conf;            ///< 配置器引用
-    sqlite3* db_;               ///< SQLite 数据库连接指针
-    string _dbPath;             ///< SQLite 数据库文件路径
+    BertInferEngine engine_;        ///< BERT 推理引擎（封装 ONNX Runtime）
+    Configer& _conf;                ///< 配置器引用（必须在 dictProducer_ 之前声明）
+    DictProducer dictProducer_;     ///< jieba 词典编辑距离匹配器（构造依赖 _conf）
+    sqlite3* db_;                   ///< SQLite 数据库连接指针
+    string _dbPath;                 ///< SQLite 数据库文件路径
 
     inline static SemanticIndexer* _ptr = nullptr;  ///< 单例指针（C++17 inline static）
 };

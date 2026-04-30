@@ -1,6 +1,8 @@
-# 语义搜索引擎 (BERT + SQLite)
+# 语义搜索引擎 (BERT + SQLite + jieba 双引擎)
 
-基于 C++17 实现的**语义搜索引擎**，使用 **BERT 模型**进行稠密向量编码，通过**向量点积（余弦相似度）** 进行语义检索。使用 **SQLite** 持久化存储文档和 embedding，替代传统的 jieba 分词 + TF-IDF + 倒排索引方案。网络层采用多 Reactor 模型 + 线程池处理并发请求。
+基于 C++17 实现的**语义搜索引擎**，使用 **BERT 模型**进行稠密向量编码，通过**向量点积（余弦相似度）** 进行语义检索。使用 **SQLite** 持久化存储文档和 embedding。网络层采用多 Reactor 模型 + 线程池处理并发请求。
+
+**双引擎词语推荐**: [`/suggest`](#-词语推荐) 端点整合了 **jieba 编辑距离(50%)** + **BGE 语义向量(50%)** 的综合评分，提供更准确的词语联想。
 
 ---
 
@@ -22,40 +24,104 @@
 ## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    客户端 (cli/client)                    │
-│        HTTP GET 请求 → JSON 响应（HTTP/1.1）              │
-└──────────────────────┬──────────────────────────────────┘
-                        │ TCP (IPv4)
-┌──────────────────────▼──────────────────────────────────┐
-│                    服务端 (src/)                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐  │
-│  │  TcpServer   │  │  threadpool  │  │   EventLoop     │  │
-│  │ (多 Reactor) │─▶│  (线程池)    │  │ (主+子事件循环)  │  │
-│  └──────┬───────┘  └──────┬───────┘  └────────────────┘  │
-│         │                 │                               │
-│  ┌──────▼─────────────────▼───────┐                      │
-│  │    onMessage() HTTP 路由       │                      │
-│  │  recvHttp() → parseHttpGet()   │                      │
-│  │  /search → SemanticIndexer     │                      │
-│  │  /semantic → SemanticIndexer   │                      │
-│  └─────────────────────────────────┘                     │
-│                                                          │
-│  ┌───────────────────────────────────────────────┐      │
-│  │            SemanticIndexer                      │      │
-│  │  ┌──────────────┐  ┌────────────────────┐      │      │
-│  │  │ BertInferEngine│  │     SQLite3 DB    │      │      │
-│  │  │ (ONNX Runtime) │  │ docs表(id,title,  │      │      │
-│  │  │ model.onnx +   │  │ url,content,      │      │      │
-│  │  │ tokenizer.json │  │ embedding BLOB)   │      │      │
-│  │  └──────────────┘  └────────────────────┘      │      │
-│  └───────────────────────────────────────────────┘      │
-│                                                          │
-│  ┌──────────────────┐  ┌──────────────────────┐          │
-│  │  WordPieceTokenizer│ │       Configer        │          │
-│  │  (BERT 子词分词)    │ │   (配置解析器)        │          │
-│  └──────────────────┘  └──────────────────────┘          │
-└───────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    客户端 (cli/client)                        │
+│        HTTP GET 请求 → JSON 响应（HTTP/1.1）                  │
+└──────────────────────┬──────────────────────────────────────┘
+                         │ TCP (IPv4)
+┌──────────────────────▼──────────────────────────────────────┐
+│                    服务端 (src/)                              │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐      │
+│  │  TcpServer   │  │  threadpool  │  │   EventLoop     │      │
+│  │ (多 Reactor) │─▶│  (线程池)    │  │ (主+子事件循环)  │      │
+│  └──────┬───────┘  └──────┬───────┘  └────────────────┘      │
+│         │                 │                                   │
+│  ┌──────▼─────────────────▼───────┐                          │
+│  │    onMessage() HTTP 路由       │                          │
+│  │  recvHttp() → parseHttpGet()   │                          │
+│  │  /search  → SemanticIndexer     │                          │
+│  │  /semantic → SemanticIndexer   │                          │
+│  │  /suggest → SemanticIndexer     │                          │
+│  └─────────────────────────────────┘                          │
+│                                                              │
+│  ┌───────────────────────────────────────────────────┐       │
+│  │            SemanticIndexer (核心模块)                │       │
+│  │  ┌──────────────────┐  ┌────────────────────┐    │       │
+│  │  │ BertInferEngine   │  │     SQLite3 DB    │    │       │
+│  │  │ (ONNX Runtime)    │  │ docs表(id,title,  │    │       │
+│  │  │ model.onnx +      │  │ url,content,      │    │       │
+│  │  │ tokenizer.json    │  │ embedding BLOB,   │    │       │
+│  │  └──────────────────┘  │ title_embedding)   │    │       │
+│  │  ┌──────────────────┐  └────────────────────┘    │       │
+│  │  │ DictProducer      │                           │       │
+│  │  │ (jieba.dict.utf8) │                           │       │
+│  │  │ Levenshtein 编辑   │                           │       │
+│  │  │ 距离 → 降准匹配    │                           │       │
+│  │  └──────────────────┘                           │       │
+│  └───────────────────────────────────────────────────┘       │
+│                                                              │
+│  ┌──────────────────┐  ┌──────────────────────┐              │
+│  │  WordPieceTokenizer│ │       Configer        │              │
+│  │  (BERT 子词分词)    │ │   (配置解析器)        │              │
+│  └──────────────────┘  └──────────────────────┘              │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 数据流架构图
+
+```
+                          ┌──────────────┐
+                          │  HTTP 请求    │
+                          │  GET /xxx?q=  │
+                          └──────┬───────┘
+                                 │ parseHttpGet()
+                                 ▼
+                          ┌──────────────┐
+                          │  路由分发      │
+                          │  onMessage()  │
+                          └──────┬───────┘
+                                 │
+              ┌──────────────────┼─────────────────────┐
+              │                  │                      │
+              ▼                  ▼                      ▼
+   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+   │  /search         │  │  /suggest        │  │  / (帮助)        │
+   │  /semantic       │  │                  │  │                  │
+   └──────┬───────────┘  └──────┬───────────┘  └──────────────────┘
+          │                     │
+          │ SemanticIndexer     │ SemanticIndexer::suggest()
+          │ ::find()            │
+          ▼                     ▼
+ ┌──────────────────┐  ┌─────────────────────────────────────┐
+ │ BERT 编码层       │  │  ┌─────────────────────────────┐   │
+ │ query → 512维向量  │  │  │ BGE 引擎 (BERT)             │   │
+ └────────┬─────────┘  │  │  query → 512维向量            │   │
+          │            │  │  SELECT title_embedding       │   │
+          ▼            │  │  dot product → top50          │   │
+ ┌──────────────────┐  │  │  提取词语 → 归一化 score_bge  │   │
+ │ SQLite 检索       │  │  └─────────────────────────────┘   │
+ │ SELECT embedding  │  │              +                     │
+ │ dot product       │  │  ┌─────────────────────────────┐   │
+ │ sort Top-10       │  │  │ jieba 引擎 (DictProducer)   │   │
+ └────────┬─────────┘  │  │  load jieba.dict.utf8        │   │
+          │            │  │  首字 + 长度过滤             │   │
+          ▼            │  │  Levenshtein 编辑距离        │   │
+ ┌──────────────────┐  │  │  → score_jieba ∈ [0,1]      │   │
+ │ JSON 裸数组       │  │  └─────────────────────────────┘   │
+ │ [{title, url,    │  │              +                     │
+ │   content,score}] │  │  ┌─────────────────────────────┐   │
+ └──────────────────┘  │  │ 融合评分                      │   │
+                       │  │  final = 0.5×score_jieba     │   │
+                       │  │        + 0.5×score_bge       │   │
+                       │  │  sort Top-10                 │   │
+                       │  └─────────────────────────────┘   │
+                       └──────────┬─────────────────────────┘
+                                  │
+                                  ▼
+                       ┌──────────────────┐
+                       │ JSON 文本数组     │
+                       │ ["词1","词2",...] │
+                       └──────────────────┘
 ```
 
 ---
@@ -66,17 +132,17 @@
 search-engine/
 ├── cli/                          # 客户端
 │   ├── client.cpp                # TCP 客户端实现
+│   ├── html/cli.html             # Web 客户端（前端页面）
 │   └── CMakeLists.txt
 ├── config/
 │   └── serch.conf                # 主配置文件（所有可调参数）
 ├── data/
 │   ├── semantic_index.db         # SQLite 数据库（自动创建，存储文档+向量）
-│   ├── yuliao/
-│   │   ├── xml/                  # RSS/XML 原始语料（分频道）
-│   │   ├── stop_words_zh.txt     # 中文停用词表
-│   │   ├── stop_words_eng.txt    # 英文停用词表
-│   │   └── ...
-│   └── doc/
+│   └── yuliao/
+│       ├── xml/                  # RSS/XML 原始语料（分频道）
+│       └── stop_words_zh.txt     # 中文停用词表
+├── dict/                         # jieba 词典文件
+│   └── jieba.dict.utf8           # jieba 词典（35 万词条）
 ├── model/                        # BERT 模型文件
 │   ├── model.onnx                # ONNX 格式 BERT 模型
 │   ├── tokenizer.json            # HuggingFace Tokenizer 配置
@@ -88,17 +154,20 @@ search-engine/
 ├── include/                      # 头文件（声明）
 │   ├── Acceptor.h                # 连接接收器
 │   ├── Configer.h                # 配置解析器
+│   ├── DictProducer.h            # jieba 词典加载 + 编辑距离模糊匹配
+│   │                            # - 加载 jieba.dict.utf8（35万词条）
+│   │                            # - find() 首字过滤 + Levenshtein 编辑距离
 │   ├── EventLoop.h               # 事件循环
 │   ├── InetAddress.h             # IP 地址封装
-│   ├── InferEngine.hpp           # BERT 推理引擎（声明）
+│   ├── InferEngine.h             # BERT 推理引擎
 │   │                            # - BertInferEngine 类：ONNX Runtime 封装
 │   │                            # - encode_single() / encode_batch()
 │   ├── mylog.h                   # 日志系统
 │   ├── PageLib.h                 # 网页库
-│   ├── SemanticIndexer.hpp       # 语义索引器（声明）
+│   ├── SemanticIndexer.h         # 语义索引器
 │   │                            # - SQLite 存储文档+embedding
 │   │                            # - buildIndex() / find() / suggest() / size()
-│   │                            # - BERT 编码 + 向量点积检索
+│   │                            # - suggest(): jieba(50%) + BGE(50%) 双引擎
 │   ├── sqlite3.h                 # SQLite3 C API 头文件（amalgamation）
 │   ├── Socket.h / SockIO.h       # Socket 封装
 │   ├── Task.h                    # 任务封装
@@ -111,14 +180,15 @@ search-engine/
 │   │                            # - tokenize() / convert_tokens_to_ids()
 │   └── json/                     # JSON 库（nlohmann）
 ├── src/                          # 源文件（实现）
-│   ├── main.cpp                  # 入口，初始化+启动
+│   ├── main.cpp                  # 入口，HTTP 路由，初始化+启动
 │   ├── Configer.cpp              # 配置解析实现
+│   ├── DictProducer.cpp          # DictProducer 实现
 │   ├── InferEngine.cpp           # BertInferEngine 实现
 │   ├── SemanticIndexer.cpp       # SemanticIndexer 实现
 │   ├── TcpServer.cpp             # 服务器网络层
 │   ├── TcpConnetion.cpp          # 连接管理
 │   ├── threadpool.cpp            # 线程池实现
-│   ├── ...                       # 其他网络组件
+│   └── ...                       # 其他网络组件
 ├── log/                          # 运行时日志输出
 ├── build/                        # 编译输出目录
 ├── CMakeLists.txt                # 顶级 CMake 配置
@@ -220,6 +290,7 @@ xmlPath:           # XML 语料库目录
 modelPath:         # BERT ONNX 模型文件路径
 vocabPath:         # HuggingFace tokenizer.json 路径
 sqliteDbPath:      # SQLite 数据库文件路径
+jiebaDictPath:     # jieba 词典文件路径（dict/jieba.dict.utf8）
 logPath:           # 日志文件路径
 
 # ==================== 网络配置 ====================
@@ -284,7 +355,7 @@ Accept: application/json
 ]
 ```
 
-**实现**: [`SemanticIndexer::find()`](include/SemanticIndexer.hpp:356)
+**实现**: [`SemanticIndexer::find()`](include/SemanticIndexer.h)
 
 搜索流程：
 1. 用 BERT 将查询编码为 512 维向量
@@ -294,7 +365,41 @@ Accept: application/json
 
 ---
 
-#### 2. 根路径（帮助信息）
+#### 2. 词语推荐
+
+**端点**: `GET /suggest?q=<关键词>`
+
+返回相关的词语推荐列表，使用 **双引擎综合评分**。
+
+**请求示例**:
+
+```
+GET /suggest?q=%E4%B9%A0%E8%BF%91%E5%B9%B3 HTTP/1.1
+Host: 127.0.0.1:8080
+Connection: keep-alive
+Accept: application/json
+```
+
+**响应示例**:
+
+```json
+["习近平", "习近平总书记", "习近平主席", "习近平新时代", "习近平思想"]
+```
+
+**双引擎评分机制**:
+
+| 引擎 | 方法 | 分数占比 | 说明 |
+|------|------|---------|------|
+| **jieba 编辑距离** | [`DictProducer::find()`](include/DictProducer.h) | 50% | 从 jieba 词典（35 万词条）中找首字母匹配、长度相近的词，计算 Levenshtein 编辑距离 → 相似度 |
+| **BGE 语义向量** | [`SemanticIndexer::suggest()`](include/SemanticIndexer.h) | 50% | BERT 编码查询 → ANN 检索 title_embedding → 提取语义相关词 → 归一化 |
+
+**综合评分**: `final_score = 0.5 × score_jieba + 0.5 × score_bge`
+
+最终按综合评分降序排列，返回 Top-10 推荐词。
+
+---
+
+#### 3. 根路径（帮助信息）
 
 **端点**: `GET /`
 
@@ -315,9 +420,12 @@ Accept: application/json
 |-------------|------|
 | `curl "http://127.0.0.1:8080/search?q=慢性病"` | 语义搜索 |
 | `curl "http://127.0.0.1:8080/semantic?q=癌症治疗"` | 语义搜索（同功能） |
+| `curl "http://127.0.0.1:8080/suggest?q=搜索"` | 词语推荐（双引擎） |
 | `curl "http://127.0.0.1:8080/"` | 查看 API 帮助 |
 
 > **语义搜索 vs 关键词搜索**：搜索"癌症"时也能找到"肿瘤"相关的文档，因为 BERT 将两者编码到了语义空间的相近位置。
+>
+> **词语推荐**：/suggest 返回 jieba(50%) + BGE(50%) 综合评分的推荐词，支持模糊匹配（如输入"搜索引"可得到"搜索引擎"）。
 
 ---
 
@@ -333,7 +441,7 @@ Accept: application/json
 
 | 命令 | 功能 |
 |------|------|
-| `<关键词>` | 默认发送 `GET /search?q=<关键词>` |
+| `<关键词>` | 词语推荐（双引擎），发送 `GET /suggest?q=<关键词>` |
 | `/search <关键词>` | 语义搜索，发送 `GET /search?q=<关键词>` |
 | `/semantic <关键词>` | 语义搜索（同功能），发送 `GET /semantic?q=<关键词>` |
 | `/qps [关键词]` | 执行 20 秒 QPS 压测（HTTP，默认关键词"搜索引擎"） |
@@ -348,22 +456,31 @@ Accept: application/json
 
 ## 核心模块说明
 
-### [`SemanticIndexer`](include/SemanticIndexer.hpp) — 语义索引器（核心模块）
+### [`SemanticIndexer`](include/SemanticIndexer.h) — 语义索引器（核心模块）
 
-- **实现文件**: [`include/SemanticIndexer.hpp`](include/SemanticIndexer.hpp)（声明） + [`src/SemanticIndexer.cpp`](src/SemanticIndexer.cpp)（实现）
-- **数据存储**: 使用 SQLite 数据库存储文档和 512 维稠密向量，替代旧版的 `newripepage.dat` + 倒排索引
+- **实现文件**: [`include/SemanticIndexer.h`](include/SemanticIndexer.h)（声明） + [`src/SemanticIndexer.cpp`](src/SemanticIndexer.cpp)（实现）
+- **数据存储**: 使用 SQLite 数据库存储文档和 512 维稠密向量
 - **`buildIndex()`**: 遍历 XML 语料 → BERT 编码 → 事务批量写入 SQLite
 - **`find()`**: BERT 编码查询 → SQLite 全表扫描 → 向量点积 → TopK 排序
-- **`suggest()`**: BERT 编码查询 → 逐标题编码 → 语义相似度排序 → 推荐 TopK 标题
+- **`suggest()`**: **双引擎综合评分** — jieba 编辑距离(50%) + BGE 语义向量(50%) → 按综合分 TopK 返回
+- **内部包含 [`DictProducer`](include/DictProducer.h)**：加载 jieba 词典，提供 Levenshtein 编辑距离匹配
 - **单例模式**: 通过 `init()` + `getPtr()` 全局访问
 
-### [`BertInferEngine`](include/InferEngine.hpp) — BERT 推理引擎
+### [`BertInferEngine`](include/InferEngine.h) — BERT 推理引擎
 
-- **实现文件**: [`include/InferEngine.hpp`](include/InferEngine.hpp)（声明） + [`src/InferEngine.cpp`](src/InferEngine.cpp)（实现）
+- **实现文件**: [`include/InferEngine.h`](include/InferEngine.h)（声明） + [`src/InferEngine.cpp`](src/InferEngine.cpp)（实现）
 - 封装 **ONNX Runtime C++ API**，加载 `model.onnx` 进行 CPU 推理
 - **`encode(text)`**: 接收字符串，返回 512 维 L2 归一化向量
 - **`encode_batch(texts)`**: 批量编码
 - 内部使用 [`WordPieceTokenizer`](include/WordPieceTokenizer.hpp) 将文本转为 token IDs
+
+### [`DictProducer`](include/DictProducer.h) — jieba 词典加载 + 编辑距离模糊匹配
+
+- **实现文件**: [`include/DictProducer.h`](include/DictProducer.h)（声明） + [`src/DictProducer.cpp`](src/DictProducer.cpp)（实现）
+- 加载 `dict/jieba.dict.utf8`（35 万词条），解析 `word freq pos_tag` 格式
+- **`find(query, topK)`**: 首字过滤 + 长度过滤 → Levenshtein 编辑距离 → 相似度排序
+- **编辑距离算法**: 两行 DP 优化，O(m×n) 时间，O(min(m,n)) 空间
+- 为 `/suggest` 提供 jieba 编辑距离评分（50% 权重）
 
 ### [`WordPieceTokenizer`](include/WordPieceTokenizer.hpp) — BERT 子词分词器
 
@@ -381,9 +498,11 @@ Accept: application/json
 ### SQLite 集成
 
 - 使用 [`include/sqlite3.h`](include/sqlite3.h)（官方 amalgamation 头文件）和系统 `libsqlite3.so.0` 运行时库
-- 建表语句：`CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT, content TEXT, embedding BLOB)`
-- embedding 以 BLOB 形式存储 512 个 float32（共 2048 字节）
+- 建表语句：`CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT, content TEXT, embedding BLOB, title_embedding BLOB)`
+- `embedding` 列：512 维 content 向量（2048 字节 BLOB），用于 `/search` 文档检索
+- `title_embedding` 列：512 维 title 向量（2048 字节 BLOB），用于 `/suggest` 词语推荐
 - 使用事务（BEGIN/COMMIT）批量写入提升性能
+- `sqlite3_busy_timeout(5000)` + 写入重试循环避免 SQLITE_BUSY
 
 ### 网络层
 
@@ -422,19 +541,21 @@ main()
   │
   ├─ [此时 g_serverReady=false]     ← 拒绝连接，提示"正在初始化"
   │
-  ├─ SemanticIndexer::init(...)    ← 初始化 BERT 引擎 + 打开 SQLite
+  ├─ SemanticIndexer::init(...)    ← 初始化 BERT 引擎 + SQLite + jieba 词典
   │   ├─ BertInferEngine(model_path, vocab_path)
   │   │   ├─ 加载 ONNX 模型到 Ort::Session
   │   │   └─ 加载 tokenizer.json 初始化 WordPieceTokenizer
-  │   └─ sqlite3_open_v2(db_path)  ← 打开/创建数据库
+  │   ├─ sqlite3_open_v2(db_path)  ← 打开/创建数据库
+  │   └─ DictProducer(jiebaDictPath) ← 加载 jieba 词典（35万词条）
   │
   ├─ SemanticIndexer::size() == 0?  ← 检查是否已有数据
   │   └── 是 → buildIndex()
   │       ├─ 遍历 XML 文件
   │       ├─ stripHtml() 清理 HTML
-  │       ├─ BertInferEngine::encode_single() → 512维向量
+  │       ├─ BertInferEngine::encode_single() → 512维向量（content）
+  │       ├─ BertInferEngine::encode_single() → 512维向量（title）← title_embedding
   │       ├─ BEGIN TRANSACTION
-  │       ├─ 逐条 INSERT INTO docs VALUES(?,?,?,?,?)
+  │       ├─ 逐条 INSERT INTO docs VALUES(?,?,?,?,?,?)
   │       └─ COMMIT
   │
   ├─ g_serverReady = true          ← 服务器就绪，开始处理请求
@@ -471,9 +592,24 @@ handleHttpRequest(path, query, con)  ← 线程池异步处理
        │                 ├── for each doc:
        │                 │     score = dot(query_vec, doc_vec)
        │                 ├── sort by score DESC
-       │                 └── return Top-10 JSON
+       │                 └── return Top-10 JSON (裸数组)
        │
-       └── 其他路径 → 返回 JSON 帮助信息
+       ├── path == "/suggest"?
+       │      └── 是 → SemanticIndexer::suggest()
+       │                 ├── BGE 引擎：
+       │                 │   ├── BertInferEngine::encode_single(query) → 512维向量
+       │                 │   ├── SELECT title_embedding FROM docs
+       │                 │   ├── dot product → top50 → 提取词语 → 归一化
+       │                 │   └── score_bge ∈ [0, 1]
+       │                 ├── jieba 引擎：
+       │                 │   ├── DictProducer::find(query, topK*3)
+       │                 │   ├── Levenshtein 编辑距离 → 相似度
+       │                 │   └── score_jieba ∈ [0, 1]
+       │                 ├── 融合: final = 0.5×score_jieba + 0.5×score_bge
+       │                 ├── sort by final DESC
+       │                 └── return Top-10 文本数组
+       │
+       └── 其他路径 → 返回 JSON API 帮助信息
        │
        ▼
   buildHttpResponse(json)          ← 包装 HTTP 响应（含 Content-Length 等头）

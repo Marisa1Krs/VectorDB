@@ -24,6 +24,7 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
     : engine_(model_path, vocab_path)
     , _conf(conf)
     , db_(nullptr)
+    , dictProducer_(_conf.getConfigMap()["jiebaDictPath"])
 {
     // 获取 SQLite 数据库路径（从配置）
     _dbPath = _conf.getConfigMap()["sqliteDbPath"];
@@ -83,6 +84,9 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
 
     // 检查是否已有数据
     checkDbStats();
+
+    LOG_INFO("SemanticIndexer: DictProducer 词典加载完成, 共 %zu 个词条",
+             dictProducer_.size());
 }
 
 // ============================================================
@@ -463,123 +467,198 @@ json SemanticIndexer::suggest(const string& query, int topK) {
         return ans;
     }
 
-    LOG_INFO("SemanticIndexer::suggest: 收到查询='%s', topK=%d", query.c_str(), topK);
+    LOG_INFO("SemanticIndexer::suggest: 收到查询='%s', topK=%d (jieba50%% + BGE50%%)",
+             query.c_str(), topK);
 
-    // ---- 1. 编码查询（BERT 推理） ----
+    // =============================================================
+    // BGE 语义引擎 — BERT 编码 → ANN → 语义词提取 → 归一化
+    // =============================================================
+
+    // 先声明 BGE 结果容器（会在不同代码路径中使用）
+    std::vector<std::pair<float, string>> bgeScored;
+    float bgeMaxScore = 0.0f;
+
+    // ---- 编码查询 ----
     std::vector<float> queryEmb = engine_.encode(query);
     if (queryEmb.empty()) {
-        LOG_ERROR("SemanticIndexer::suggest: 查询编码失败, query='%s'", query.c_str());
-        return ans;
-    }
-    LOG_INFO("SemanticIndexer::suggest: 查询编码完成, dim=%zu", queryEmb.size());
+        LOG_ERROR("SemanticIndexer::suggest: BGE 查询编码失败, query='%s'", query.c_str());
+    } else {
+        LOG_INFO("SemanticIndexer::suggest: BGE 查询编码完成, dim=%zu", queryEmb.size());
 
-    // ---- 2. ANN 搜索：全表扫描 + 点积（余弦相似度） ----
-    // 使用 title_embedding（标题嵌入）做语义匹配，确保"词语-标题"对齐
-    // 这是最简单的 ANN 实现（暴力搜索），对于 4000+ 文档数量级完全够用
-    constexpr int ANN_TOP_N = 50;
-    const char* sql = "SELECT title, title_embedding FROM docs WHERE title_embedding IS NOT NULL;";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        LOG_ERROR("SemanticIndexer::suggest: 查询失败: %s", sqlite3_errmsg(db_));
-        return ans;
-    }
-
-    // 存储 (语义得分, 标题) 对
-    std::vector<std::pair<float, string>> scoredTitles;
-    int rowCount = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        rowCount++;
-        const char* title = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        if (!title) continue;
-        string titleStr(title);
-        if (titleStr.empty()) continue;
-
-        const void* blob = sqlite3_column_blob(stmt, 1);
-        int nBytes = sqlite3_column_bytes(stmt, 1);
-        int nFloats = nBytes / static_cast<int>(sizeof(float));
-        if (!blob || nFloats <= 0) continue;
-
-        const float* embData = static_cast<const float*>(blob);
-        float dot = 0.0f;
-        size_t dim = std::min(queryEmb.size(), static_cast<size_t>(nFloats));
-        for (size_t j = 0; j < dim; ++j) {
-            dot += queryEmb[j] * embData[j];
+        // ---- ANN 搜索：全表扫描 + 点积 ----
+        constexpr int ANN_TOP_N = 50;
+        const char* sql = "SELECT title, title_embedding FROM docs WHERE title_embedding IS NOT NULL;";
+        sqlite3_stmt* stmt = nullptr;
+        bool annOk = true;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            LOG_ERROR("SemanticIndexer::suggest: ANN 查询失败: %s", sqlite3_errmsg(db_));
+            annOk = false;
         }
-        scoredTitles.push_back({dot, std::move(titleStr)});
-    }
-    sqlite3_finalize(stmt);
 
-    LOG_INFO("SemanticIndexer::suggest: ANN 扫描 %d 行", rowCount);
+        std::vector<std::pair<float, string>> scoredTitles;
+        if (annOk) {
+            int rowCount = 0;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                rowCount++;
+                const char* title = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (!title) continue;
+                string titleStr(title);
+                if (titleStr.empty()) continue;
 
-    if (scoredTitles.empty()) {
-        LOG_WARN("SemanticIndexer::suggest: 无有效评分结果");
-        return ans;
-    }
+                const void* blob = sqlite3_column_blob(stmt, 1);
+                int nBytes = sqlite3_column_bytes(stmt, 1);
+                int nFloats = nBytes / static_cast<int>(sizeof(float));
+                if (!blob || nFloats <= 0) continue;
 
-    // ---- 3. 按语义得分排序，取 topN ----
-    std::partial_sort(scoredTitles.begin(),
-                      scoredTitles.begin() + std::min(ANN_TOP_N, (int)scoredTitles.size()),
-                      scoredTitles.end(),
-                      [](const std::pair<float, string>& a, const std::pair<float, string>& b) {
-                          return a.first > b.first;
-                      });
+                const float* embData = static_cast<const float*>(blob);
+                float dot = 0.0f;
+                size_t dim = std::min(queryEmb.size(), static_cast<size_t>(nFloats));
+                for (size_t j = 0; j < dim; ++j) {
+                    dot += queryEmb[j] * embData[j];
+                }
+                scoredTitles.push_back({dot, std::move(titleStr)});
+            }
+            sqlite3_finalize(stmt);
+            LOG_INFO("SemanticIndexer::suggest: BGE ANN 扫描 %d 行", rowCount);
 
-    int topN = std::min(ANN_TOP_N, (int)scoredTitles.size());
-    LOG_INFO("SemanticIndexer::suggest: ANN top%d 最高分=%f, 最低分=%f",
-             topN, scoredTitles[0].first, scoredTitles[topN-1].first);
+            if (scoredTitles.empty()) {
+                LOG_WARN("SemanticIndexer::suggest: BGE ANN 无有效评分结果");
+            }
+        }
 
-    // ---- 4. 从 topN 标题中提取词语，按语义得分加权 ----
-    // word → {总得分, 出现次数}
-    std::unordered_map<string, std::pair<float, int>> wordStats;
-    for (int i = 0; i < topN; ++i) {
-        const auto& scored = scoredTitles[i];
-        float docScore = scored.first;
-        std::vector<std::string> extracted = _suggest_extractWords(scored.second);
+        // ---- 按语义得分排序，取 topN ----
+        if (!scoredTitles.empty()) {
+            std::partial_sort(scoredTitles.begin(),
+                              scoredTitles.begin() + std::min(ANN_TOP_N, (int)scoredTitles.size()),
+                              scoredTitles.end(),
+                              [](const std::pair<float, string>& a, const std::pair<float, string>& b) {
+                                  return a.first > b.first;
+                              });
 
-        for (const auto& word : extracted) {
-            auto& stat = wordStats[word];
-            stat.first += docScore;  // 累加语义得分
-            stat.second++;           // 累加出现次数
+            int topN = std::min(ANN_TOP_N, (int)scoredTitles.size());
+            LOG_INFO("SemanticIndexer::suggest: BGE top%d 最高分=%f, 最低分=%f",
+                     topN, scoredTitles[0].first, scoredTitles[topN-1].first);
+
+            // ---- 从 topN 标题中提取词语，按语义得分加权 ----
+            std::unordered_map<string, std::pair<float, int>> bgeWordStats;
+            for (int i = 0; i < topN; ++i) {
+                const auto& scored = scoredTitles[i];
+                float docScore = scored.first;
+                std::vector<std::string> extracted = _suggest_extractWords(scored.second);
+
+                for (const auto& word : extracted) {
+                    auto& stat = bgeWordStats[word];
+                    stat.first += docScore;
+                    stat.second++;
+                }
+            }
+
+            LOG_INFO("SemanticIndexer::suggest: BGE 提取到 %zu 个候选词语", bgeWordStats.size());
+
+            // ---- 计算 BGE 最终得分 = 语义得分和 × log(1+频率) ----
+            for (const auto& w : bgeWordStats) {
+                float score = w.second.first * std::log(1.0f + w.second.second);
+                if (score > bgeMaxScore) bgeMaxScore = score;
+                bgeScored.push_back({score, w.first});
+            }
         }
     }
 
-    LOG_INFO("SemanticIndexer::suggest: 提取到 %zu 个候选词语", wordStats.size());
+    // =============================================================
+    // Jieba 引擎 — 编辑距离模糊匹配（降准匹配）
+    // =============================================================
 
-    if (wordStats.empty()) {
-        LOG_WARN("SemanticIndexer::suggest: 未能从标题中提取到词语");
-        return ans;
+    auto jiebaResults = dictProducer_.find(query, topK * 3);
+    LOG_INFO("SemanticIndexer::suggest: Jieba 编辑距离匹配到 %zu 个候选词",
+             jiebaResults.size());
+
+    // =============================================================
+    // 合并评分 — jieba(50%) + BGE(50%)
+    // =============================================================
+
+    // ---- 构建 jieba 分数映射 ----
+    std::unordered_map<string, float> jiebaScoreMap;
+    for (const auto& jr : jiebaResults) {
+        jiebaScoreMap[jr.first] = jr.second;
     }
 
-    // ---- 5. 按 (加权得分 * log(1+频率)) 排序 ----
-    std::vector<std::pair<float, string>> scoredWords;
-    for (const auto& w : wordStats) {
-        // 综合得分 = 语义得分和 * log(1+出现次数)
-        float combined = w.second.first * std::log(1.0f + w.second.second);
-        scoredWords.push_back({combined, w.first});
+    // ---- 合并分数 ----
+    std::unordered_map<string, float> combinedScores;
+
+    // 遍历 jieba 结果（保证 jieba 词全被覆盖）
+    for (const auto& jr : jiebaResults) {
+        float scoreJ = jr.second;                          // jieba 分 [0, 1]
+        float scoreB = 0.0f;                               // 默认 BGE 分
+        if (!bgeScored.empty() && bgeMaxScore > 0.0f) {
+            for (const auto& bs : bgeScored) {
+                if (bs.second == jr.first) {
+                    scoreB = bs.first / bgeMaxScore;       // 归一化 [0, 1]
+                    break;
+                }
+            }
+        }
+        combinedScores[jr.first] = 0.5f * scoreJ + 0.5f * scoreB;
     }
 
-    std::sort(scoredWords.begin(), scoredWords.end(),
+    // 遍历 BGE 结果中未被 jieba 覆盖的词
+    for (const auto& bs : bgeScored) {
+        if (jiebaScoreMap.find(bs.second) == jiebaScoreMap.end()) {
+            float scoreB = (bgeMaxScore > 0.0f) ? (bs.first / bgeMaxScore) : 0.0f;
+            combinedScores[bs.second] = 0.5f * scoreB;     // jieba 分 = 0
+        }
+    }
+
+    // ---- 按综合评分排序 ----
+    std::vector<std::pair<float, string>> finalScored;
+    for (const auto& cs : combinedScores) {
+        finalScored.push_back({cs.second, cs.first});
+    }
+    std::sort(finalScored.begin(), finalScored.end(),
               [](const std::pair<float, string>& a, const std::pair<float, string>& b) {
                   return a.first > b.first;
               });
 
-    // ---- 6. 返回 topK 词语 ----
+    // ---- 返回 topK ----
     int count = 0;
-    for (const auto& sw : scoredWords) {
+    for (const auto& fs : finalScored) {
         if (count >= topK) break;
-        ans.push_back(sw.second);
+        ans.push_back(fs.second);
         count++;
     }
 
-    LOG_INFO("SemanticIndexer::suggest: 返回 %d 个词语推荐, query='%s'",
+    LOG_INFO("SemanticIndexer::suggest: 返回 %d 个词语推荐 (jieba50%% + BGE50%%), query='%s'",
              count, query.c_str());
-    if (count > 0) {
-        LOG_INFO("SemanticIndexer::suggest: top1='%s', 综合得分=%f, 语义得分=%f, 出现%d次",
-                 ans[0].get<string>().c_str(), scoredWords[0].first,
-                 wordStats[scoredWords[0].second].first,
-                 wordStats[scoredWords[0].second].second);
+    if (count > 0 && !finalScored.empty()) {
+        float top1J = 0.0f, top1B = 0.0f;
+        auto it = jiebaScoreMap.find(finalScored[0].second);
+        if (it != jiebaScoreMap.end()) top1J = it->second;
+        if (!bgeScored.empty() && bgeMaxScore > 0.0f) {
+            for (const auto& bs : bgeScored) {
+                if (bs.second == finalScored[0].second) {
+                    top1B = bs.first / bgeMaxScore;
+                    break;
+                }
+            }
+        }
+        LOG_INFO("SemanticIndexer::suggest: top1='%s', 综合=%f, jieba=%f, bge=%f",
+                 ans[0].get<string>().c_str(), finalScored[0].first, top1J, top1B);
     }
 
+    return ans;
+}
+
+// ============================================================
+// jieba 降准匹配 — 编辑距离模糊匹配（用于 /search 的"您是不是想找"）
+// ============================================================
+
+json SemanticIndexer::jiebaSuggest(const string& query, int topK) const {
+    json ans = json::array();
+    auto results = dictProducer_.find(query, topK);
+    for (const auto& r : results) {
+        ans.push_back(r.first);
+    }
+    LOG_INFO("SemanticIndexer::jiebaSuggest: query='%s', 匹配到 %zu 个词",
+             query.c_str(), results.size());
     return ans;
 }
 

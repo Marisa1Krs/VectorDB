@@ -164,16 +164,14 @@ void handleHttpRequest(const string& path, const string& query, shared_ptr<TcpCo
     json msgJson;
 
     if (path == "/search" || path == "/semantic") {
-        // 语义搜索（替代原 PageLibPreprocessor 的倒排索引搜索）
-        // 使用 BERT 模型进行语义匹配，替代 jieba 分词 + TF-IDF
+        // 语义搜索（BERT 向量检索）
         if (!query.empty()) {
             msgJson = SemanticIndexer::getPtr()->find(query);
         } else {
             msgJson["error"] = "请提供搜索关键词，例如 GET /search?q=关键词";
         }
     } else if (path == "/suggest") {
-        // 词语推荐 — 使用 BERT 语义相似度匹配文档标题
-        // 替代原 DictProducer::find() 基于编辑距离的词典推荐
+        // 词语推荐 — jieba(50%) + BGE(50%) 综合评分
         if (!query.empty()) {
             msgJson = SemanticIndexer::getPtr()->suggest(query);
         } else {
@@ -184,16 +182,16 @@ void handleHttpRequest(const string& path, const string& query, shared_ptr<TcpCo
         json endpoints = json::array();
         json ep1, ep2, ep3;
         ep1["path"] = "/search?q=关键词";
-        ep1["description"] = "语义搜索（BERT 模型，替代原倒排索引）";
+        ep1["description"] = "语义搜索（BERT 引擎 + jieba 降准匹配）";
         ep2["path"] = "/semantic?q=关键词";
         ep2["description"] = "同上，语义搜索";
         ep3["path"] = "/suggest?q=关键词";
-        ep3["description"] = "词语推荐 — 基于 BERT 语义相似度的文档标题推荐（替代原 DictProducer）";
+        ep3["description"] = "词语推荐 — jieba(50%) + BGE(50%) 综合评分";
         endpoints.push_back(ep1);
         endpoints.push_back(ep2);
         endpoints.push_back(ep3);
-        msgJson["usage"] = "搜索引擎 HTTP API — 基于 BERT 语义搜索";
-        msgJson["note"] = "已移除 jieba 分词、倒排索引、词典构建，全部改用模型推理搜索";
+        msgJson["usage"] = "搜索引擎 HTTP API — BERT 语义搜索 + jieba 降准匹配";
+        msgJson["note"] = "双引擎架构：jieba 编辑距离(50%) + BGE 语义向量(50%)";
         msgJson["endpoints"] = endpoints;
     }
 
