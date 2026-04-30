@@ -1,15 +1,12 @@
-#include "Jieba.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <thread>
-#include "Simhasher.hpp"
-#include"json.hpp"
-#include"mylog.h"
-#include"DictProducer.h"
-#include"Configer.h"
-#include"PageLibPreprocessor.h"
+#include "json.hpp"
+#include "mylog.h"
+#include "Configer.h"
+#include "SemanticIndexer.h"
 #include "InetAddress.h"
 #include "Socket.h"
 #include "Acceptor.h"
@@ -19,10 +16,11 @@
 #include "TcpServer.h"
 #include "threadpool.h"
 #include "Task.h"
+
 TcpServer *server = nullptr;
 threadpool *tpool = nullptr;
 
-// 服务器就绪标志：构建倒排索引期间为 false，完成后设为 true
+// 服务器就绪标志：构建语义索引期间为 false，完成后设为 true
 // 在构建索引期间，客户端连接将被拒绝并收到提示
 volatile bool g_serverReady = false;
 
@@ -33,8 +31,8 @@ using std::cout;
 using std::endl;
 using std::string;
 using std::vector;
-using namespace simhash;
 using json = nlohmann::json;
+
 vector<string> splitBySpace(const std::string &input)
 {
     vector<string> result;
@@ -44,7 +42,6 @@ vector<string> splitBySpace(const std::string &input)
     {
         if (c == ' ')
         {
-            // 遇到空格且当前字符串不为空时，添加到结果并重置当前字符串
             if (!current.empty())
             {
                 result.push_back(current);
@@ -53,12 +50,10 @@ vector<string> splitBySpace(const std::string &input)
         }
         else
         {
-            // 非空格字符则添加到当前字符串
             current += c;
         }
     }
 
-    // 处理最后一个单词（如果存在）
     if (!current.empty())
     {
         result.push_back(current);
@@ -66,9 +61,11 @@ vector<string> splitBySpace(const std::string &input)
 
     return result;
 }
+
 // ============================================================
 // HTTP 协议辅助函数
 // ============================================================
+
 // 简易 URL 解码：将 %XX 替换为字符
 string urlDecode(const string& input) {
     string result;
@@ -94,7 +91,6 @@ string urlDecode(const string& input) {
 // 解析 HTTP GET 请求，提取路径和查询参数 q
 // 输入格式: "GET /search?q=keyword HTTP/1.1\r\n..."
 void parseHttpGet(const string& request, string& path, string& query) {
-    // 取请求行（第一行）
     size_t lineEnd = request.find("\r\n");
     if (lineEnd == string::npos) {
         path = "/"; query = "";
@@ -102,7 +98,6 @@ void parseHttpGet(const string& request, string& path, string& query) {
     }
     string reqLine = request.substr(0, lineEnd);
 
-    // 解析 "GET /path?q=xxx HTTP/1.1"
     size_t firstSpace = reqLine.find(' ');
     if (firstSpace == string::npos) { path = "/"; query = ""; return; }
     size_t secondSpace = reqLine.find(' ', firstSpace + 1);
@@ -110,12 +105,10 @@ void parseHttpGet(const string& request, string& path, string& query) {
 
     string uri = reqLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
 
-    // 分离路径和查询字符串
     size_t qmark = uri.find('?');
     if (qmark != string::npos) {
         path = uri.substr(0, qmark);
         string queryStr = uri.substr(qmark + 1);
-        // 查找 q= 参数
         size_t pos = 0;
         while (pos < queryStr.size()) {
             size_t amp = queryStr.find('&', pos);
@@ -124,7 +117,7 @@ void parseHttpGet(const string& request, string& path, string& query) {
             if (eq != string::npos) {
                 string key = pair.substr(0, eq);
                 string val = pair.substr(eq + 1);
-                if (key == "q") {
+                if (key == "q" || key == "query" || key == "keywords") {
                     query = urlDecode(val);
                     break;
                 }
@@ -163,52 +156,60 @@ string buildHttpResponse(const string& body, const string& contentType, int stat
 }
 
 // ============================================================
-// HTTP 请求处理函数：根据路径路由到不同的搜索服务
+// HTTP 请求处理函数：使用语义搜索替代倒排索引
 // ============================================================
 void handleHttpRequest(const string& path, const string& query, shared_ptr<TcpConnetion> con)
 {
     LOG_INFO("HTTP path=%s, query=%s", path.c_str(), query.c_str());
     json msgJson;
 
-    if (path == "/search") {
-        // 网页搜索（PageLibPreprocessor 倒排索引检索）
-        if (!query.empty())
-            msgJson = PageLibPreprocessor::getPtr()->find(query);
-        else
+    if (path == "/search" || path == "/semantic") {
+        // 语义搜索（替代原 PageLibPreprocessor 的倒排索引搜索）
+        // 使用 BERT 模型进行语义匹配，替代 jieba 分词 + TF-IDF
+        if (!query.empty()) {
+            msgJson = SemanticIndexer::getPtr()->find(query);
+        } else {
             msgJson["error"] = "请提供搜索关键词，例如 GET /search?q=关键词";
+        }
     } else if (path == "/suggest") {
-        // 词典搜索 / 关键词联想（DictProducer 前缀匹配）
-        if (!query.empty())
-            msgJson = DictProducer::getPtr()->find(query, 5);
-        else
-            msgJson["info"] = "请输入关键词获取联想提示，例如 GET /suggest?q=关键词";
+        // 词语推荐 — 使用 BERT 语义相似度匹配文档标题
+        // 替代原 DictProducer::find() 基于编辑距离的词典推荐
+        if (!query.empty()) {
+            msgJson = SemanticIndexer::getPtr()->suggest(query);
+        } else {
+            msgJson["error"] = "请提供关键词，例如 GET /suggest?q=搜索";
+        }
     } else {
         // 根路径或未知路径，返回 API 使用帮助
         json endpoints = json::array();
-        json ep1, ep2;
-        ep1["path"] = "/suggest?q=关键词";
-        ep1["description"] = "关键词联想（词典搜索）";
-        ep2["path"] = "/search?q=关键词";
-        ep2["description"] = "网页内容搜索";
+        json ep1, ep2, ep3;
+        ep1["path"] = "/search?q=关键词";
+        ep1["description"] = "语义搜索（BERT 模型，替代原倒排索引）";
+        ep2["path"] = "/semantic?q=关键词";
+        ep2["description"] = "同上，语义搜索";
+        ep3["path"] = "/suggest?q=关键词";
+        ep3["description"] = "词语推荐 — 基于 BERT 语义相似度的文档标题推荐（替代原 DictProducer）";
         endpoints.push_back(ep1);
         endpoints.push_back(ep2);
-        msgJson["usage"] = "搜索引擎 HTTP API";
+        endpoints.push_back(ep3);
+        msgJson["usage"] = "搜索引擎 HTTP API — 基于 BERT 语义搜索";
+        msgJson["note"] = "已移除 jieba 分词、倒排索引、词典构建，全部改用模型推理搜索";
         msgJson["endpoints"] = endpoints;
     }
 
     string httpResp = buildHttpResponse(msgJson);
     con->sendInLoop(httpResp);
 }
+
 void onNewConnet(const shared_ptr<TcpConnetion> &con)
 {
     cout << "新链接到来 " << con->getFd() << endl;
 }
+
 void onMessage(const shared_ptr<TcpConnetion> &con)
 {
-    // 读取完整 HTTP 请求头（直到 \r\n\r\n）
     string httpReq = con->recvHttp();
 
-    // 解析 HTTP GET 请求，提取路径和查询参数
     string path, query;
     parseHttpGet(httpReq, path, query);
 
@@ -225,13 +226,13 @@ void onMessage(const shared_ptr<TcpConnetion> &con)
         return;
     }
 
-    // 服务器正在构建倒排索引，拒绝处理请求
+    // 服务器正在构建语义索引，拒绝处理请求
     if (!g_serverReady) {
         json errJson;
-        errJson["error"] = "服务器正在初始化倒排索引，请稍后再试";
+        errJson["error"] = "服务器正在初始化语义索引（BERT 编码中），请稍后再试";
         errJson["status"] = "initializing";
         con->sendInLoop(buildHttpResponse(errJson, 503, "Service Unavailable"));
-        LOG_WARN("拒绝请求：服务器正在初始化倒排索引");
+        LOG_WARN("拒绝请求：服务器正在初始化语义索引");
         return;
     }
 
@@ -240,13 +241,14 @@ void onMessage(const shared_ptr<TcpConnetion> &con)
         json helpJson;
         json endpoints = json::array();
         json ep1, ep2;
-        ep1["path"] = "/suggest?q=关键词";
-        ep1["description"] = "关键词联想（词典搜索）";
-        ep2["path"] = "/search?q=关键词";
-        ep2["description"] = "网页内容搜索";
+        ep1["path"] = "/search?q=关键词";
+        ep1["description"] = "语义搜索（BERT 模型）";
+        ep2["path"] = "/semantic?q=关键词";
+        ep2["description"] = "同上，语义搜索";
         endpoints.push_back(ep1);
         endpoints.push_back(ep2);
-        helpJson["usage"] = "搜索引擎 HTTP API - 请提供查询参数 q";
+        helpJson["usage"] = "搜索引擎 HTTP API — 基于 BERT 语义搜索";
+        helpJson["note"] = "已移除 jieba 分词、倒排索引、词典构建";
         helpJson["endpoints"] = endpoints;
         con->sendInLoop(buildHttpResponse(helpJson));
         return;
@@ -257,14 +259,16 @@ void onMessage(const shared_ptr<TcpConnetion> &con)
     t->setTask(std::bind(&handleHttpRequest, path, query, con));
     tpool->addTask(t);
 }
+
 void onClose(const shared_ptr<TcpConnetion> &con)
 {
     cout << "链接已经关闭" << endl;
 }
+
 int main()
 {
     // 配置文件路径（唯一保留的硬编码路径，作为配置入口）
-    string confPath="/home/marisa/code1/search-engine/config/serch.conf";
+    string confPath = "/home/marisa/code1/VectorDB/config/serch.conf";
     Configer con(confPath);
     auto& cfg = con.getConfigMap();
 
@@ -274,9 +278,9 @@ int main()
     int logLevel = std::stoi(cfg["logLevel"]);
     mylog::init(logPath, logBufSize, static_cast<LogLevel>(logLevel));
 
-    // 加载静态 HTML 页面到内存缓存（从配置文件路径推导项目根目录）
-    string htmlPath = confPath.substr(0, confPath.rfind('/'));     // 去掉 "serch.conf"
-    htmlPath = htmlPath.substr(0, htmlPath.rfind('/'));            // 去掉 "config"
+    // 加载静态 HTML 页面到内存缓存
+    string htmlPath = confPath.substr(0, confPath.rfind('/'));
+    htmlPath = htmlPath.substr(0, htmlPath.rfind('/'));
     htmlPath += "/cli/html/cli.html";
     std::ifstream ifs(htmlPath);
     if (ifs) {
@@ -291,8 +295,6 @@ int main()
 
     // ============================================================
     // 第一阶段：启动 TCP 服务器和线程池
-    // TcpServer::start() 阻塞运行主 EventLoop（accept 连接）
-    // 此时 g_serverReady = false，客户端连接会收到"正在初始化"提示
     // ============================================================
     string serverIp = cfg["serverIp"];
     string serverPort = cfg["serverPort"];
@@ -307,35 +309,56 @@ int main()
     server->setCallBack(onNewConnet, onMessage, onClose);
     tpool->start();
 
-    // 在后台线程中启动 TcpServer（mainLoop.loop() 阻塞运行主 EventLoop）
+    // 在后台线程中启动 TcpServer
     std::thread serverThread([]() {
-        LOG_INFO("TCP 服务器已启动，主 EventLoop 监听新连接（索引构建中...）");
+        LOG_INFO("TCP 服务器已启动，主 EventLoop 监听新连接（语义索引构建中...）");
         server->start();
     });
 
     // ============================================================
-    // 第二阶段：构建词典和倒排索引（耗时较长）
-    // 在此期间如果客户端连接，onMessage() 会拒绝请求
+    // 第二阶段：构建语义索引（替代原倒排索引 + 词典构建）
+    //
+    // 【变更说明】
+    // 原代码：
+    //   DictProducer::init(con);
+    //   DictProducer::getPtr()->buildEnDict();
+    //   DictProducer::getPtr()->buildCnDict();
+    //   PageLibPreprocessor::init(con);
+    //   PageLibPreprocessor::getPtr()->doProcess();
+    //
+    // 上述代码已被完全删除，原因：
+    //   - jieba 分词（DictProducer）被 BERT 模型替代
+    //   - 倒排索引（PageLibPreprocessor）被向量检索替代
+    //   - 不再需要构建中英文词典
+    //   - 不再需要 TF-IDF 计算
+    //
+    // 新逻辑：
+    //   1. 初始化 SemanticIndexer（打开 SQLite 数据库）
+    //   2. 如果数据库为空，解析 XML → BERT 编码 → 写入 SQLite
+    //   3. 如果已有数据，跳过构建（程序重启后直接使用已有索引）
     // ============================================================
-    LOG_INFO("开始构建英文词典...");
-    DictProducer::init(con);
-    DictProducer::getPtr()->buildEnDict();
+    LOG_INFO("开始初始化语义搜索引擎...");
 
-    LOG_INFO("开始构建中文词典...");
-    DictProducer::getPtr()->buildCnDict();
+    string modelPath = cfg["modelPath"];
+    string vocabPath = cfg["vocabPath"];
+    SemanticIndexer::init(modelPath, vocabPath, con);
 
-    LOG_INFO("开始构建倒排索引...");
-    PageLibPreprocessor::init(con);
-    PageLibPreprocessor::getPtr()->doProcess();
+    // 检查是否需要构建索引
+    if (SemanticIndexer::getPtr()->size() == 0) {
+        LOG_INFO("SQLite 数据库为空，开始构建语义索引...");
+        SemanticIndexer::getPtr()->buildIndex();
+        LOG_INFO("语义索引构建完成");
+    } else {
+        LOG_INFO("SQLite 数据库已有 %zu 篇文档，跳过索引构建", SemanticIndexer::getPtr()->size());
+    }
 
     // ============================================================
     // 第三阶段：索引构建完成，允许处理客户端请求
     // ============================================================
     g_serverReady = true;
-    LOG_INFO("倒排索引构建完成，服务器已就绪，开始处理客户端请求");
+    LOG_INFO("语义索引已就绪，服务器开始处理客户端请求");
 
     // 主线程等待服务器线程结束
     serverThread.join();
     return 0;
 }
-

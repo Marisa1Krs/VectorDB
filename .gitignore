@@ -67,3 +67,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# SQLite database (auto-created at runtime)
+data/semantic_index.db
+data/semantic_index.db-wal
+data/semantic_index.db-shm
+
+# Runtime data files
+data/doc/problem
+data/newripepage.dat

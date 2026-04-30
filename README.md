@@ -1,6 +1,6 @@
-# 中文搜索引擎
+# 语义搜索引擎 (BERT + SQLite)
 
-基于 C++11 实现的轻量级中文搜索引擎，提供**词典搜索**（关键词联想）和**网页搜索**（内容检索）两种功能。使用 Reactor 网络模型 + 线程池处理并发请求，集成 cppjieba 分词和 simhash 去重。
+基于 C++17 实现的**语义搜索引擎**，使用 **BERT 模型**进行稠密向量编码，通过**向量点积（余弦相似度）** 进行语义检索。使用 **SQLite** 持久化存储文档和 embedding，替代传统的 jieba 分词 + TF-IDF + 倒排索引方案。网络层采用多 Reactor 模型 + 线程池处理并发请求。
 
 ---
 
@@ -15,6 +15,7 @@
 - [客户端使用](#客户端使用)
 - [核心模块说明](#核心模块说明)
 - [数据流](#数据流)
+- [技术原理](#技术原理)
 
 ---
 
@@ -36,17 +37,23 @@
 │  ┌──────▼─────────────────▼───────┐                      │
 │  │    onMessage() HTTP 路由       │                      │
 │  │  recvHttp() → parseHttpGet()   │                      │
-│  │  /suggest → DictProducer       │                      │
-│  │  /search  → PageLibPreprocessor │                      │
-│  └─────────────────────────────────┘                      │
-│                                                           │
+│  │  /search → SemanticIndexer     │                      │
+│  │  /semantic → SemanticIndexer   │                      │
+│  └─────────────────────────────────┘                     │
+│                                                          │
+│  ┌───────────────────────────────────────────────┐      │
+│  │            SemanticIndexer                      │      │
+│  │  ┌──────────────┐  ┌────────────────────┐      │      │
+│  │  │ BertInferEngine│  │     SQLite3 DB    │      │      │
+│  │  │ (ONNX Runtime) │  │ docs表(id,title,  │      │      │
+│  │  │ model.onnx +   │  │ url,content,      │      │      │
+│  │  │ tokenizer.json │  │ embedding BLOB)   │      │      │
+│  │  └──────────────┘  └────────────────────┘      │      │
+│  └───────────────────────────────────────────────┘      │
+│                                                          │
 │  ┌──────────────────┐  ┌──────────────────────┐          │
-│  │   DictProducer    │  │ PageLibPreprocessor  │          │
-│  │   (词典构建/搜索)  │  │ (网页库/倒排索引)     │          │
-│  └──────────────────┘  └──────────────────────┘          │
-│  ┌──────────────────┐  ┌──────────────────────┐          │
-│  │   SplitTool       │  │       Configer       │          │
-│  │ (jieba 分词封装)   │  │   (配置解析器)       │          │
+│  │  WordPieceTokenizer│ │       Configer        │          │
+│  │  (BERT 子词分词)    │ │   (配置解析器)        │          │
 │  └──────────────────┘  └──────────────────────┘          │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -63,48 +70,51 @@ search-engine/
 ├── config/
 │   └── serch.conf                # 主配置文件（所有可调参数）
 ├── data/
-│   ├── newripepage.dat           # 处理后网页库（XML 格式）
+│   ├── semantic_index.db         # SQLite 数据库（自动创建，存储文档+向量）
 │   ├── yuliao/
 │   │   ├── xml/                  # RSS/XML 原始语料（分频道）
-│   │   ├── chinese/              # 中文语料文本
-│   │   ├── english/              # 英文语料文本
 │   │   ├── stop_words_zh.txt     # 中文停用词表
 │   │   ├── stop_words_eng.txt    # 英文停用词表
 │   │   └── ...
 │   └── doc/
-├── dict/                         # jieba 分词词典
-│   ├── jieba.dict.utf8           # 核心词典
-│   ├── hmm_model.utf8            # HMM 模型
-│   ├── user.dict.utf8            # 用户自定义词典
-│   ├── idf.utf8                  # IDF 权重
-│   └── stop_words.utf8           # 停用词
-├── include/                      # 头文件
+├── model/                        # BERT 模型文件
+│   ├── model.onnx                # ONNX 格式 BERT 模型
+│   ├── tokenizer.json            # HuggingFace Tokenizer 配置
+│   ├── vocab.txt                 # 词表（备用）
+│   ├── config.json               # 模型配置
+│   └── onnxruntime_lib/          # ONNX Runtime 预编译库
+│       ├── include/              # C/C++ API 头文件
+│       └── lib/                  # .so 动态库文件
+├── include/                      # 头文件（声明）
 │   ├── Acceptor.h                # 连接接收器
 │   ├── Configer.h                # 配置解析器
-│   ├── DictProducer.h            # 词典生产者
 │   ├── EventLoop.h               # 事件循环
 │   ├── InetAddress.h             # IP 地址封装
+│   ├── InferEngine.hpp           # BERT 推理引擎（声明）
+│   │                            # - BertInferEngine 类：ONNX Runtime 封装
+│   │                            # - encode_single() / encode_batch()
 │   ├── mylog.h                   # 日志系统
 │   ├── PageLib.h                 # 网页库
-│   ├── PageLibPreprocessor.h     # 网页库预处理（倒排索引）
+│   ├── SemanticIndexer.hpp       # 语义索引器（声明）
+│   │                            # - SQLite 存储文档+embedding
+│   │                            # - buildIndex() / find() / suggest() / size()
+│   │                            # - BERT 编码 + 向量点积检索
+│   ├── sqlite3.h                 # SQLite3 C API 头文件（amalgamation）
 │   ├── Socket.h / SockIO.h       # Socket 封装
-│   ├── SplitTool.h               # 分词工具封装
 │   ├── Task.h                    # 任务封装
 │   ├── taskQueue.h               # 线程安全任务队列
 │   ├── TcpConnetion.h            # TCP 连接封装
 │   ├── TcpServer.h               # TCP 服务器（Reactor）
 │   ├── threadpool.h              # 线程池
-│   ├── WebPage.h                 # 网页文档模型
-│   ├── cppjieba/                 # jieba 分词库（头文件）
-│   ├── json/                     # JSON 库（nlohmann）
-│   └── simhash/                  # simhash 去重库
-├── src/                          # 源文件
+│   ├── WordPieceTokenizer.hpp    # BERT 子词分词器（header-only）
+│   │                            # - 加载 tokenizer.json
+│   │                            # - tokenize() / convert_tokens_to_ids()
+│   └── json/                     # JSON 库（nlohmann）
+├── src/                          # 源文件（实现）
 │   ├── main.cpp                  # 入口，初始化+启动
 │   ├── Configer.cpp              # 配置解析实现
-│   ├── DictProducer.cpp          # 词典构建
-│   ├── PageLibPreprocessor.cpp   # 倒排索引构建+搜索
-│   ├── SplitTool.cpp             # 分词封装
-│   ├── WebPage.cpp               # 网页处理
+│   ├── InferEngine.cpp           # BertInferEngine 实现
+│   ├── SemanticIndexer.cpp       # SemanticIndexer 实现
 │   ├── TcpServer.cpp             # 服务器网络层
 │   ├── TcpConnetion.cpp          # 连接管理
 │   ├── threadpool.cpp            # 线程池实现
@@ -122,16 +132,20 @@ search-engine/
 | 组件 | 版本 |
 |------|------|
 | 操作系统 | Linux (Ubuntu 18.04+) |
-| 编译器 | GCC 4.8.4+ (需支持 C++11) |
+| 编译器 | GCC 7.0+（需要 C++17 支持） |
 | CMake | 3.10+ |
 | tinyxml2 | 用于 XML 解析（编译时链接） |
+| SQLite3 | 运行时 libsqlite3.so（动态链接） |
+| ONNX Runtime | 预编译版 1.25.1（已包含在 `model/onnxruntime_lib/`） |
 
 ### 安装依赖
 
 ```bash
 # Ubuntu / Debian
-sudo apt-get install build-essential cmake libtinyxml2-dev
+sudo apt-get install build-essential cmake libtinyxml2-dev libsqlite3-dev
 ```
+
+> 如果没有 root 权限，可以使用系统自带的 `libsqlite3.so.0` 运行时库，并提供 `sqlite3.h` 头文件（已包含在 `include/sqlite3.h`）。
 
 ---
 
@@ -152,26 +166,36 @@ make -j$(nproc)
 
 ### 2. 配置
 
-编辑 [`config/serch.conf`](config/serch.conf) 确保所有路径指向正确的目录。
+编辑 [`config/serch.conf`](config/serch.conf) 确保以下路径正确：
+
+```ini
+modelPath:  /home/marisa/code1/VectorDB/model/model.onnx   # BERT ONNX 模型
+vocabPath:  /home/marisa/code1/VectorDB/model/tokenizer.json # Tokenizer 配置
+sqliteDbPath: /home/marisa/code1/VectorDB/data/semantic_index.db  # SQLite 数据库
+xmlPath:    /home/marisa/code1/search-engine/data/yuliao/xml  # XML 语料目录
+```
 
 **首次运行前需要确保：**
-- XML 语料库在 [`data/yuliao/xml/`](data/yuliao/xml/) 目录下
-- jieba 词典文件在 [`dict/`](dict/) 目录下
-- 停用词文件在 [`data/yuliao/`](data/yuliao/) 目录下
+- BERT 模型文件 [`model.onnx`](model/model.onnx) 和 [`tokenizer.json`](model/tokenizer.json) 存在
+- XML 语料库在 [`xmlPath`](config/serch.conf) 指向的目录下
 
 ### 3. 运行服务端
 
 ```bash
 cd build
-./server
+LD_LIBRARY_PATH=../model/onnxruntime_lib/lib ./server
 ```
+
+> 需设置 `LD_LIBRARY_PATH` 包含 ONNX Runtime 动态库路径。
 
 启动过程：
 1. 加载配置 & 初始化日志
 2. **启动 TCP 服务器 & 线程池**（此时 `g_serverReady = false`，客户端连接会被拒绝并提示"正在初始化"）
-3. 构建英文/中文词典
-4. 解析 XML 语料，生成网页库和倒排索引
-5. `g_serverReady = true`，开始正常处理客户端请求
+3. 初始化 BERT 推理引擎（加载 model.onnx 到 ONNX Runtime）
+4. 打开/创建 SQLite 数据库，检查 `docs` 表中是否有数据
+5. **无数据时**：遍历 XML 语料 → BERT 编码为 512 维向量 → 写入 SQLite
+6. **已有数据时**：跳过建库，直接提供服务
+7. `g_serverReady = true`，开始正常处理客户端请求
 
 ### 4. 运行客户端
 
@@ -193,17 +217,10 @@ cd build
 ```ini
 # ==================== 路径配置 ====================
 xmlPath:           # XML 语料库目录
-webPagePath:       # 处理后网页库文件路径
-chineseDir:        # 中文语料目录（词典构建）
-englishDir:        # 英文语料目录
-stopWordsCnPath:   # 中文停用词路径
-stopWordsEnPath:   # 英文停用词路径
+modelPath:         # BERT ONNX 模型文件路径
+vocabPath:         # HuggingFace tokenizer.json 路径
+sqliteDbPath:      # SQLite 数据库文件路径
 logPath:           # 日志文件路径
-jiebaDictPath:     # jieba 核心词典
-hmmPath:           # jieba HMM 模型
-userDictPath:      # jieba 用户词典
-idfPath:           # jieba IDF 路径
-jiebaStopWordPath: # jieba 停用词路径
 
 # ==================== 网络配置 ====================
 serverIp:          # 监听 IP 地址
@@ -213,13 +230,6 @@ subEventLoopCount: # 子 EventLoop 数量（多 Reactor 模型）
 # ==================== 线程池配置 ====================
 threadPoolThreadCount: # 工作线程数
 threadPoolQueueSize:   # 任务队列最大长度
-
-# ==================== 算法参数 ====================
-topNVal:           # 关键词提取 / simhash 的 TopN 值
-simhashDistance:   # 海明距离阈值（去重相似度）
-englishBufSize:    # 英文缓冲区大小
-chineseBufSize:    # 中文缓冲区大小
-stopFileBufSize:   # 停用词文件缓冲区大小
 
 # ==================== 日志配置 ====================
 logBufferSize:     # 日志缓冲区大小（条目数）
@@ -240,32 +250,11 @@ logLevel:          # 日志级别：0=DEBUG 1=INFO 2=WARN 3=ERROR
 
 ### API 端点
 
-#### 1. 词典搜索（关键词联想 / 提示词）
+#### 1. 语义搜索
 
-**端点**: `GET /suggest?q=<关键词>`
+**端点**: `GET /search?q=<关键词>` 或 `GET /semantic?q=<关键词>`
 
-**请求示例**:
-
-```
-GET /suggest?q=%E6%90%9C%E7%B4%A2 HTTP/1.1
-Host: 127.0.0.1:8080
-Connection: keep-alive
-Accept: application/json
-```
-
-**响应示例**:
-
-```json
-["搜索引擎", "搜索", "引擎", "检索", "查询"]
-```
-
-**实现**: [`DictProducer::find()`](include/DictProducer.h:27) — 基于索引找出候选词，计算编辑距离后返回 Top-K（默认 5 个）。
-
----
-
-#### 2. 网页搜索（内容检索）
-
-**端点**: `GET /search?q=<关键词>`
+两个端点功能完全相同，均使用 BERT 语义搜索。
 
 **请求示例**:
 
@@ -279,24 +268,33 @@ Accept: application/json
 **响应示例**:
 
 ```json
-{
-    "title": "文章标题",
-    "url": "原文链接",
-    "content": "摘要文本..."
-}
+[
+    {
+        "title": "文章标题",
+        "url": "原文链接",
+        "content": "摘要文本...",
+        "score": 0.8923
+    },
+    {
+        "title": "另一篇相关文章",
+        "url": "https://example.com/article2",
+        "content": "摘要文本...",
+        "score": 0.7641
+    }
+]
 ```
 
-**实现**: [`PageLibPreprocessor::find()`](include/PageLibPreprocessor.h:25)
+**实现**: [`SemanticIndexer::find()`](include/SemanticIndexer.hpp:356)
 
 搜索流程：
-1. 用 jieba 的 `KeywordExtractor` 提取关键词（Top-5）
-2. 在倒排索引中查找每个关键词对应的文档集合
-3. 取多个关键词文档集合的交集
-4. 计算余弦相似度，返回最相关的一篇文档
+1. 用 BERT 将查询编码为 512 维向量
+2. 从 SQLite 读取所有文档的 embedding
+3. 计算查询向量与每个文档向量的点积（余弦相似度）
+4. 按相似度降序排列，返回 Top-10
 
 ---
 
-#### 3. 根路径（帮助信息）
+#### 2. 根路径（帮助信息）
 
 **端点**: `GET /`
 
@@ -309,15 +307,17 @@ Accept: application/json
 | 状态码 | 含义 |
 |--------|------|
 | 200 OK | 请求成功 |
-| 503 Service Unavailable | 服务器正在初始化倒排索引，请稍后再试 |
+| 503 Service Unavailable | 服务器正在初始化（BERT 模型加载或索引构建中） |
 
 ### 查询示例
 
 | `curl` 命令 | 描述 |
 |-------------|------|
-| `curl "http://127.0.0.1:8080/suggest?q=搜索"` | 词典搜索 |
-| `curl "http://127.0.0.1:8080/search?q=慢性病"` | 网页搜索 |
+| `curl "http://127.0.0.1:8080/search?q=慢性病"` | 语义搜索 |
+| `curl "http://127.0.0.1:8080/semantic?q=癌症治疗"` | 语义搜索（同功能） |
 | `curl "http://127.0.0.1:8080/"` | 查看 API 帮助 |
+
+> **语义搜索 vs 关键词搜索**：搜索"癌症"时也能找到"肿瘤"相关的文档，因为 BERT 将两者编码到了语义空间的相近位置。
 
 ---
 
@@ -333,8 +333,9 @@ Accept: application/json
 
 | 命令 | 功能 |
 |------|------|
-| `<关键词>` | 词典搜索（关键词联想），发送 `GET /suggest?q=<关键词>` |
-| `/search <关键词>` | 网页搜索（内容检索），发送 `GET /search?q=<关键词>` |
+| `<关键词>` | 默认发送 `GET /search?q=<关键词>` |
+| `/search <关键词>` | 语义搜索，发送 `GET /search?q=<关键词>` |
+| `/semantic <关键词>` | 语义搜索（同功能），发送 `GET /semantic?q=<关键词>` |
 | `/qps [关键词]` | 执行 20 秒 QPS 压测（HTTP，默认关键词"搜索引擎"） |
 | `/help` 或 `/h` | 显示帮助 |
 | `/quit` 或 `/exit` 或 `/q` | 退出客户端 |
@@ -347,34 +348,42 @@ Accept: application/json
 
 ## 核心模块说明
 
+### [`SemanticIndexer`](include/SemanticIndexer.hpp) — 语义索引器（核心模块）
+
+- **实现文件**: [`include/SemanticIndexer.hpp`](include/SemanticIndexer.hpp)（声明） + [`src/SemanticIndexer.cpp`](src/SemanticIndexer.cpp)（实现）
+- **数据存储**: 使用 SQLite 数据库存储文档和 512 维稠密向量，替代旧版的 `newripepage.dat` + 倒排索引
+- **`buildIndex()`**: 遍历 XML 语料 → BERT 编码 → 事务批量写入 SQLite
+- **`find()`**: BERT 编码查询 → SQLite 全表扫描 → 向量点积 → TopK 排序
+- **`suggest()`**: BERT 编码查询 → 逐标题编码 → 语义相似度排序 → 推荐 TopK 标题
+- **单例模式**: 通过 `init()` + `getPtr()` 全局访问
+
+### [`BertInferEngine`](include/InferEngine.hpp) — BERT 推理引擎
+
+- **实现文件**: [`include/InferEngine.hpp`](include/InferEngine.hpp)（声明） + [`src/InferEngine.cpp`](src/InferEngine.cpp)（实现）
+- 封装 **ONNX Runtime C++ API**，加载 `model.onnx` 进行 CPU 推理
+- **`encode(text)`**: 接收字符串，返回 512 维 L2 归一化向量
+- **`encode_batch(texts)`**: 批量编码
+- 内部使用 [`WordPieceTokenizer`](include/WordPieceTokenizer.hpp) 将文本转为 token IDs
+
+### [`WordPieceTokenizer`](include/WordPieceTokenizer.hpp) — BERT 子词分词器
+
+- 从 `tokenizer.json`（HuggingFace 格式）加载词表和分词配置
+- 实现 BERT 标准的 WordPiece 分词算法
+- 自动添加 `[CLS]` / `[SEP]` 特殊标记
+- 支持中文字符自动加空格（中文不需要分词，按字切分）
+
 ### [`Configer`](include/Configer.h) — 配置解析器
 
 - 读取 `serch.conf`，每行 `key:value` 格式
 - 跳过 `#` 开头的注释行，支持内联注释
 - 提供 `getConfigMap()` 获取键值对映射
 
-### [`SplitTool`](include/SplitTool.h) — 分词工具封装
+### SQLite 集成
 
-- 封装 cppjieba 的 `Jieba` 和 simhash 的 `Simhasher`
-- `cut()` — 调用 jieba `MixSegment` 算法分词
-- `extract()` — 调用 `KeywordExtractor` 提取关键词及权重
-- `make()` — 计算文本的 simhash 指纹（用于去重）
-- 单例模式，通过 `init(Configer&)` 从配置文件读取词典路径
-
-### [`DictProducer`](include/DictProducer.h) — 词典生产者
-
-- **英文词典**: 读取英文语料 → `washWordsEn()`（大写转小写，非字母变空格）→ `loadDict()` 统计词频
-- **中文词典**: 读取中文语料 → `washWordsCn()`（jieba 分词）→ `loadDict()`
-- **搜索**: `find()` — 基于字符索引检索候选词，编辑距离排序
-- 单例模式，配置值在 `init()` 时从 Configer 读取
-
-### [`PageLibPreprocessor`](include/PageLibPreprocessor.h) — 网页库预处理
-
-- **`readInfoFromFile()`**: 解析 XML 语料（RSS 格式）→ 提取 title/content/url → 写入 `newripepage.dat`（网页库）→ 构建 `_offsetLib`（偏移库）
-- **`buildInvertIndex()`**: 两遍扫描构建倒排索引
-  - 第一遍：分词 → 统计每篇文档的词频（TF）
-  - 第二遍：计算 IDF → 计算 TF-IDF 权重 → 存入 `_invertIndex`
-- **`find()`**: 关键词提取 → 倒排索引查找 → 文档交集 → 余弦相似度排序 → 返回最相关文档
+- 使用 [`include/sqlite3.h`](include/sqlite3.h)（官方 amalgamation 头文件）和系统 `libsqlite3.so.0` 运行时库
+- 建表语句：`CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT, content TEXT, embedding BLOB)`
+- embedding 以 BLOB 形式存储 512 个 float32（共 2048 字节）
+- 使用事务（BEGIN/COMMIT）批量写入提升性能
 
 ### 网络层
 
@@ -413,14 +422,20 @@ main()
   │
   ├─ [此时 g_serverReady=false]     ← 拒绝连接，提示"正在初始化"
   │
-  ├─ DictProducer::init(con)       ← 初始化分词器 + 词典
-  │   └─ SplitTool::init(con)      ← 从配置读取 jieba 路径
-  ├─ buildEnDict()                 ← 构建英文词典
-  ├─ buildCnDict()                 ← 构建中文词典
-  ├─ PageLibPreprocessor::init(con)
-  ├─ doProcess()
-  │   ├─ readInfoFromFile()        ← 解析 XML → 网页库
-  │   └─ buildInvertIndex()        ← 构建倒排索引
+  ├─ SemanticIndexer::init(...)    ← 初始化 BERT 引擎 + 打开 SQLite
+  │   ├─ BertInferEngine(model_path, vocab_path)
+  │   │   ├─ 加载 ONNX 模型到 Ort::Session
+  │   │   └─ 加载 tokenizer.json 初始化 WordPieceTokenizer
+  │   └─ sqlite3_open_v2(db_path)  ← 打开/创建数据库
+  │
+  ├─ SemanticIndexer::size() == 0?  ← 检查是否已有数据
+  │   └── 是 → buildIndex()
+  │       ├─ 遍历 XML 文件
+  │       ├─ stripHtml() 清理 HTML
+  │       ├─ BertInferEngine::encode_single() → 512维向量
+  │       ├─ BEGIN TRANSACTION
+  │       ├─ 逐条 INSERT INTO docs VALUES(?,?,?,?,?)
+  │       └─ COMMIT
   │
   ├─ g_serverReady = true          ← 服务器就绪，开始处理请求
   └─ serverThread.join()
@@ -446,18 +461,17 @@ TcpServer::onMessage()
        ▼
 handleHttpRequest(path, query, con)  ← 线程池异步处理
        │
-       ├── path == "/suggest"?
-       │      └── 是 → DictProducer::find()
-       │                 ├── 字符索引检索候选词
-       │                 ├── 编辑距离排序
-       │                 └── 返回 JSON 数组
-       │
-       ├── path == "/search"?
-       │      └── 是 → PageLibPreprocessor::find()
-       │                 ├── KeywordExtractor 提取关键词
-       │                 ├── 倒排索引查找文档
-       │                 ├── 取文档交集
-       │                 └── 余弦相似度排序 → 返回 JSON
+       ├── path == "/search" 或 "/semantic"?
+       │      └── 是 → SemanticIndexer::find()
+       │                 ├── BertInferEngine::encode_single(query)
+       │                 │     ├── WordPieceTokenizer::tokenize()
+       │                 │     ├── ONNX Runtime 推理
+       │                 │     └── L2 归一化 → 512维向量
+       │                 ├── SELECT id,title,url,content,embedding FROM docs
+       │                 ├── for each doc:
+       │                 │     score = dot(query_vec, doc_vec)
+       │                 ├── sort by score DESC
+       │                 └── return Top-10 JSON
        │
        └── 其他路径 → 返回 JSON 帮助信息
        │
@@ -467,6 +481,41 @@ handleHttpRequest(path, query, con)  ← 线程池异步处理
        ▼
   con->sendInLoop(httpResponse)    ← 发送 HTTP 响应
 ```
+
+---
+
+## 技术原理
+
+### 为什么用 BERT 替代 jieba？
+
+| 维度 | jieba + TF-IDF（旧方案） | BERT 语义搜索（新方案） |
+|------|------------------------|----------------------|
+| **匹配方式** | 关键词字面匹配 | 语义空间向量匹配 |
+| **同义词处理** | "电脑"搜不到"计算机" | "电脑"和"计算机"向量距离很近 |
+| **上下文理解** | 不支持（每个词独立统计） | 支持（Transformer 双向注意力） |
+| **预处理复杂度** | 加载 5+ 个词典文件 → 分词 → 去停用词 → TF-IDF | 直接输入原始文本 |
+| **向量维度** | 稀疏（词典大小，数万维） | 稠密（固定 512 维） |
+| **检索方式** | 倒排索引 + 集合交集 | 向量点积 + 排序 |
+
+### 为什么用 SQLite 替代文件 I/O？
+
+| 维度 | 旧方案（newripepage.dat） | 新方案（SQLite） |
+|------|-------------------------|-----------------|
+| **写操作** | `open + lseek + write` 手动管理偏移 | `INSERT INTO docs VALUES(...)` |
+| **读操作** | `open + lseek + read` 按偏移量读取 | `SELECT * FROM docs` |
+| **并发安全** | 无保障 | ACID 事务隔离 |
+| **崩溃恢复** | 文件可能损坏 | WAL 模式 + 原子提交 |
+| **元数据** | 无，偏移量需额外记录 | `PRIMARY KEY, COUNT(*), ...` |
+| **扩展性** | 新增字段需重写文件格式 | `ALTER TABLE ADD COLUMN` |
+
+### 向量检索的数学原理
+
+1. **BERT 编码器**：将变长文本映射到固定 512 维浮点数向量空间
+2. **L2 归一化**：`v = v / ||v||`，使每个向量的欧几里得长度为 1
+3. **点积 = 余弦相似度**：当 `||A|| = ||B|| = 1` 时：
+   - `cos(θ) = (A·B) / (||A||·||B||) = A·B`
+   - 即点积直接等于余弦相似度，无需额外除法
+4. **排序**：对所有文档计算 `score = query_emb · doc_emb`，取 TopK 最大值
 
 ---
 
