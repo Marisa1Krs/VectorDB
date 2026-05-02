@@ -36,13 +36,81 @@
 #include <cmath>
 #include <cstring>
 #include <dirent.h>
+#include <list>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "json.hpp"
 #include "mylog.h"
 
 using json = nlohmann::json;
+
+// ============================================================
+// LfuCache — 低频淘汰缓存（Least Frequently Used）
+// ============================================================
+
+/**
+ * @brief 简单的 LFU 缓存，用于缓存搜索/推荐结果
+ *
+ * 工作原理：
+ *   1. 每个缓存的条目都记录"被访问了多少次"
+ *   2. 查缓存时，命中的条目频率 +1
+ *   3. 缓存满了要放新条目时，踢掉访问频率最低的那个
+ *   4. 如果频率一样，踢掉最早放进去的
+ *
+ * 为什么要用 LFU：
+ *   - 搜索场景中，高频词（如"癌症"、"糖尿病"）会被反复查
+ *   - LFU 会保留这些热词的结果，省掉每次都要 BERT 推理 + SQLite 扫描
+ *   - 低频词（用户随便搜的）自然被淘汰，不影响热词缓存
+ *
+ * 线程安全：内部用 std::mutex 保护，多线程同时调用没问题
+ */
+struct LfuCache {
+    /// @brief 构造
+    /// @param cap 最大能缓存多少个条目（默认 1000）
+    explicit LfuCache(size_t cap = 1000) : capacity_(cap) {}
+
+    /**
+     * @brief 从缓存中取结果
+     * @param key  查询词（如"癌症"）
+     * @return 如果命中，返回缓存的 JSON 结果；没命中返回空 optional
+     *
+     * 命中后会把访问频率 +1（LFU 的核心逻辑）
+     */
+    std::optional<json> get(const std::string& key);
+
+    /**
+     * @brief 把结果放进缓存
+     * @param key    查询词
+     * @param value  要缓存的结果（JSON）
+     *
+     * 如果缓存已满，会淘汰访问频率最低的条目。
+     * 如果 key 已经存在，覆盖旧值并把频率 +1
+     */
+    void put(const std::string& key, json value);
+
+    /// 清空缓存
+    void clear();
+
+    /// 当前缓存条目数
+    size_t size() const;
+
+    /// 最大缓存容量
+    size_t capacity() const { return capacity_; }
+
+private:
+    size_t capacity_;                                    ///< 最大条目数
+    mutable std::mutex mtx_;                             ///< 线程安全锁
+    std::unordered_map<std::string,
+                       std::pair<json, size_t>> entries_; ///< key → {结果, 访问频率}
+    std::list<std::string> order_;                       ///< 插入顺序（同频率时淘汰最老的）
+
+    /// 淘汰频率最低的一个条目
+    void evictOne();
+};
 
 // ============================================================
 // SemanticIndexer — 语义搜索引擎
@@ -232,15 +300,19 @@ private:
 
     BertInferEngine engine_;        ///< BERT 模型引擎（负责把文字转向量）
     Configer& _conf;                ///< 配置器（读配置文件用）
-    DictProducer dictProducer_;     ///< jieba 词典匹配器（编辑距离模糊搜索）
+    DictProducer dictProducer_;     ///< jieba 词典匹配器（编辑距离模糊匹配）
     sqlite3* db_;                   ///< SQLite 数据库连接
     string _dbPath;                 ///< 数据库文件路径
 
     // ---- IVF 分堆搜索相关 ----
     IVFIndex ivfIndex_;             ///< IVF 分堆索引（K-Means 聚类）
-    string ivfIndexPath_;           ///< IVF 索引文件存哪
+    string ivfIndexPath_;           ///<  IVF 索引文件存哪
     bool ivfTrained_ = false;       ///< IVF 训练好了没（有文件就算训练好）
     int ivfNprobe_ = 5;            ///< 搜索时看最近的几个堆（默认 5）
+
+    // ---- LFU 缓存（提升 QPS） ----
+    LfuCache searchCache_;          ///< 语义搜索结果缓存（find），容量 500
+    LfuCache suggestCache_;         ///< 词语推荐结果缓存（suggest），容量 500
 
     inline static SemanticIndexer* _ptr = nullptr;  ///< 单例指针（整个程序只有一份）
 };

@@ -15,6 +15,87 @@
 #include <cmath>
 
 // ============================================================
+// LfuCache 实现 — 低频淘汰缓存
+// ============================================================
+
+std::optional<json> LfuCache::get(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = entries_.find(key);
+    if (it == entries_.end()) {
+        return std::nullopt;  // 没命中
+    }
+    it->second.second++;       // 命中，访问频率 +1
+    return it->second.first;   // 返回缓存的结果
+}
+
+void LfuCache::put(const std::string& key, json value) {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    // 如果 key 已存在，直接覆盖 + 频率 +1
+    auto it = entries_.find(key);
+    if (it != entries_.end()) {
+        it->second.first = std::move(value);
+        it->second.second++;
+        return;
+    }
+
+    // 缓存满了，淘汰一个
+    if (entries_.size() >= capacity_) {
+        evictOne();
+    }
+
+    // 插入新条目（频率初始为 1）
+    entries_[key] = {std::move(value), 1};
+    order_.push_back(key);
+}
+
+void LfuCache::clear() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    entries_.clear();
+    order_.clear();
+}
+
+size_t LfuCache::size() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return entries_.size();
+}
+
+void LfuCache::evictOne() {
+    if (entries_.empty()) return;
+
+    // 策略：扫描所有条目，找频率最低的
+    // 如果频率一样，淘汰最早插入的（order_ 靠前的）
+    size_t minFreq = SIZE_MAX;
+    std::string evictKey;
+    size_t minOrder = SIZE_MAX;
+
+    size_t idx = 0;
+    for (const auto& key : order_) {
+        auto it = entries_.find(key);
+        if (it == entries_.end()) continue;  // 不应该发生，但安全起见跳过
+
+        if (it->second.second < minFreq ||
+            (it->second.second == minFreq && idx < minOrder)) {
+            minFreq = it->second.second;
+            evictKey = it->first;
+            minOrder = idx;
+        }
+        idx++;
+    }
+
+    if (!evictKey.empty()) {
+        entries_.erase(evictKey);
+        // 从 order_ 里也移除
+        for (auto oit = order_.begin(); oit != order_.end(); ++oit) {
+            if (*oit == evictKey) {
+                order_.erase(oit);
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================
 // 构造函数 —— 初始化引擎 + 打开 SQLite 数据库 + 加载 IVF
 // ============================================================
 
@@ -38,6 +119,7 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
     }
 
     // ---- 打开（或创建）SQLite 数据库 ----
+    // 主连接：用于建表、写入、IVF 训练等写操作
     int rc = sqlite3_open_v2(
         _dbPath.c_str(),
         &db_,
@@ -53,6 +135,20 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
 
     // 如果数据库正忙，最多等 5 秒
     sqlite3_busy_timeout(db_, 5000);
+
+    // ---- 启用 WAL 模式（Write-Ahead Logging） ----
+    // WAL 模式允许：多个线程同时读（不互斥），写入不阻塞读取
+    // 没有 WAL 的话，一个线程在读时其他线程只能干等
+    {
+        char* errMsg = nullptr;
+        rc = sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, &errMsg);
+        if (rc != SQLITE_OK) {
+            LOG_WARN("SemanticIndexer: 启用 WAL 模式失败: %s", errMsg ? errMsg : "unknown");
+            sqlite3_free(errMsg);
+        } else {
+            LOG_INFO("SemanticIndexer: 已启用 WAL 模式，支持多线程并发读取");
+        }
+    }
 
     // ---- 建表：存文章和向量 ----
     const char* createTableSQL =
@@ -395,6 +491,15 @@ json SemanticIndexer::find(const string& query, int topK) {
         return ans;
     }
 
+    // ---- 0. 查 LFU 缓存：如果之前搜过同样的词，直接返回 ----
+    {
+        auto cached = searchCache_.get(query);
+        if (cached.has_value()) {
+            LOG_INFO("SemanticIndexer::find: LFU 缓存命中，直接返回 query='%s'", query.c_str());
+            return cached.value();
+        }
+    }
+
     // ---- 1. 把查询词也转成向量 ----
     std::vector<float> queryEmb = engine_.encode(query);
 
@@ -499,6 +604,9 @@ json SemanticIndexer::find(const string& query, int topK) {
              query.c_str(), resultCount,
              ivfTrained_ ? "IVF加速" : "全表扫描",
              resultCount > 0 ? scoredDocs[0].first : 0.0);
+
+    // ---- 6. 把结果写入 LFU 缓存，下次同样的查询直接秒回 ----
+    searchCache_.put(query, ans);
 
     return ans;
 }
@@ -616,6 +724,15 @@ json SemanticIndexer::suggest(const string& query, int topK) {
     if (!db_ || query.empty()) {
         LOG_WARN("SemanticIndexer::suggest: db_=null 或 query 为空, query='%s'", query.c_str());
         return ans;
+    }
+
+    // ---- 查 LFU 缓存：同样的推荐词直接返回 ----
+    {
+        auto cached = suggestCache_.get(query);
+        if (cached.has_value()) {
+            LOG_INFO("SemanticIndexer::suggest: LFU 缓存命中 query='%s'，跳过 BERT+SQLite", query.c_str());
+            return cached.value();
+        }
     }
 
     LOG_INFO("SemanticIndexer::suggest: 收到查询='%s', topK=%d (jieba50%% + BGE50%%)",
@@ -794,6 +911,9 @@ json SemanticIndexer::suggest(const string& query, int topK) {
         LOG_INFO("SemanticIndexer::suggest: top1='%s', 综合=%f, jieba=%f, bge=%f",
                  ans[0].get<string>().c_str(), finalScored[0].first, top1J, top1B);
     }
+
+    // ---- 写入 LFU 缓存，下次同样的词直接秒回 ----
+    suggestCache_.put(query, ans);
 
     return ans;
 }

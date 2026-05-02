@@ -62,6 +62,12 @@ static const size_t BERT_HIDDEN_SIZE = 512;
  * @endcode
  *
  * @note 必须使用 C++17 或更高版本编译（ONNX Runtime 1.25.1 要求）
+ *
+ * @note 线程安全说明：
+ *   本类使用单例共享的 OrtSession，不是线程安全的。
+ *   多线程同时调用 encode() 会导致崩溃，因为 OrtSession::Run() 内部有状态。
+ *   目前搜索引擎使用单线程处理请求（线程池队列本质上是串行处理的），
+ *   如果有并发需求，请将 OrtSession 改为 thread_local 每线程独立加载。
  */
 class BertInferEngine {
 public:
@@ -179,17 +185,18 @@ private:
     const OrtApi* api_ = nullptr;                      ///< ONNX Runtime C API 函数表
     EnvPtr            env_{nullptr, {nullptr}};         ///< ORT 环境
     SessionOptionsPtr sess_opts_{nullptr, {nullptr}};  ///< Session 选项
-    SessionPtr        session_{nullptr,   {nullptr}};  ///< ORT Session
     MemoryInfoPtr     mem_info_{nullptr,  {nullptr}};  ///< CPU 内存信息
+    SessionPtr        session_{nullptr, {nullptr}};     ///< 全局共享的 ONNX Session（单线程使用）
 
     WordPieceTokenizer tokenizer_;                     ///< WordPiece 分词器
 
     const char* input_names_[3]  = {};                 ///< 输入张量名称
     const char* output_names_[1] = {};                 ///< 输出张量名称
 
-    std::vector<int64_t> input_ids_buf_;               ///< input_ids 缓冲区
-    std::vector<int64_t> attn_mask_buf_;               ///< attention_mask 缓冲区
-    std::vector<int64_t> token_type_buf_;              ///< token_type_ids 缓冲区
+    // 输入缓冲区（单线程共享，多线程调用需要外部加锁）
+    std::vector<int64_t> input_ids_buf_;   ///< input_ids 缓冲区
+    std::vector<int64_t> attn_mask_buf_;   ///< attention_mask 缓冲区
+    std::vector<int64_t> token_type_buf_;  ///< token_type_ids 缓冲区
 };
 
 #endif // INFER_ENGINE_HPP

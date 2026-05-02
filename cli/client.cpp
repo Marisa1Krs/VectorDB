@@ -14,6 +14,7 @@
  *   - /search <关键词> 进行网页搜索
  *   - /quit 或 /exit 退出
  *   - /help 显示帮助
+ *   - /qps <线程数> <秒数>  多线程并发压测
  */
 
 #include <arpa/inet.h>
@@ -21,15 +22,45 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <numeric>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 constexpr int BUFFER_SIZE = 65536;
+
+// ============================================================
+// 随机查询词池（覆盖多种语料相关的搜索词）
+// ============================================================
+static const std::vector<std::string> kQueryPool = {
+    "搜索引擎", "慢性病",    "癌症",    "治疗",     "糖尿病",
+    "高血压",   "心脏病",   "肿瘤",    "药品",     "预防",
+    "健康",     "医疗",     "手术",    "疫苗",     "病毒",
+    "感染",     "免疫",     "中医",    "西医",     "康复",
+    "营养",     "饮食",     "运动",    "睡眠",     "心理",
+    "抑郁",     "焦虑",     "怀孕",    "儿科",     "老年",
+    "护理",     "急救",     "骨折",    "眼科",     "口腔",
+    "皮肤",     "过敏",     "遗传",    "检查",     "体检",
+    "诊断",     "药物",     "化疗",    "放疗",     "中医",
+    "针灸",     "推拿",     "养生",    "保健",     "食品",
+    "儿童",     "成人",     "老人",    "妇女",     "男性",
+    "戒烟",     "减肥",     "美容",    "整形",     "牙科",
+    "近视",     "远视",     "听力",    "耳聋",     "鼻炎",
+    "哮喘",     "肺炎",     "肝炎",    "肾炎",     "贫血",
+    "白血病",   "淋巴",     "骨折",    "关节",     "脊柱",
+    "脑梗",     "中风",     "痴呆",    "帕金森",   "癫痫",
+    "失眠",     "头痛",     "胃痛",    "腹泻",     "便秘",
+};
 
 // ============================================================
 // URL 编码：将非 ASCII 和特殊字符转为 %XX 格式
@@ -313,84 +344,159 @@ void showHelp() {
 // ============================================================
 // QPS 压测函数：在指定时间内持续发送 HTTP GET 请求，统计 QPS
 // ============================================================
-void runBenchmark(const std::string& serverIp, unsigned short serverPort,
-                  const std::string& query, int durationSec = 20) {
-    SearchClient client(serverIp, serverPort);
-    if (!client.connect()) {
-        std::cerr << "[错误] QPS 测试：无法连接服务器" << std::endl;
-        return;
-    }
+// ============================================================
+// 线程安全随机词选择器
+// ============================================================
+static std::string pickRandomWord() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> dist(0, kQueryPool.size() - 1);
+    return kQueryPool[dist(rng)];
+}
 
+// ============================================================
+// 单线程压测数据
+// ============================================================
+struct ThreadBenchResult {
+    long long total   = 0;
+    long long success = 0;
+    long long failed  = 0;
+    std::vector<double> latencies;  // 毫秒
+};
+
+// ============================================================
+// 多线程并发压测（核心函数）
+// ============================================================
+void runBenchmark(const std::string& serverIp, unsigned short serverPort,
+                  int numThreads, int durationSec) {
     std::cout << "\n══════════════════════════════════════════════════════════"
               << std::endl;
-    std::cout << "  开始 QPS 压测 (HTTP)" << std::endl;
-    std::cout << "  端点: /suggest?q=" << query << std::endl;
-    std::cout << "  测试时长: " << durationSec << " 秒" << std::endl;
+    std::cout << "  多线程 QPS 压测 (HTTP)" << std::endl;
+    std::cout << "  服务器:         " << serverIp << ":" << serverPort << std::endl;
+    std::cout << "  线程数:         " << numThreads << std::endl;
+    std::cout << "  测试时长:       " << durationSec << " 秒" << std::endl;
+    std::cout << "  查询词池:       " << kQueryPool.size() << " 个随机词" << std::endl;
     std::cout << "══════════════════════════════════════════════════════════"
               << std::endl
               << std::endl;
 
     auto startTime = std::chrono::steady_clock::now();
-    long long totalRequests = 0;
-    long long successRequests = 0;
-    long long failedRequests = 0;
-    auto endTime = startTime + std::chrono::seconds(durationSec);
+    std::atomic<long long> gTotal{0}, gSuccess{0}, gFailed{0};
+    std::mutex latencyMutex;
+    std::vector<double> allLatencies;
 
-    // 持续发送 HTTP 请求直到时间结束
-    while (std::chrono::steady_clock::now() < endTime) {
-        if (!client.isConnected()) {
-            std::cerr << "[错误] QPS 测试：连接已断开，尝试重连..." << std::endl;
+    // 启动 N 个线程
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            // 每个线程独立连接
+            SearchClient client(serverIp, serverPort);
             if (!client.connect()) {
-                std::cerr << "[错误] QPS 测试：重连失败，终止测试" << std::endl;
-                break;
+                std::cerr << "[线程" << t << "] 连接失败" << std::endl;
+                return;
             }
-        }
 
-        totalRequests++;
-        if (!client.sendSuggestQuery(query)) {
-            failedRequests++;
-            continue;
-        }
+            ThreadBenchResult local;
+            auto endTime = startTime + std::chrono::seconds(durationSec);
 
-        std::string response = client.receiveResponse(1000); // 1秒超时
-        if (response.empty()) {
-            failedRequests++;
-        } else {
-            successRequests++;
-        }
+            while (std::chrono::steady_clock::now() < endTime) {
+                // 检查连接状态，断开则重连
+                if (!client.isConnected()) {
+                    client.disconnect();
+                    if (!client.connect()) {
+                        local.failed++;
+                        continue;
+                    }
+                }
 
-        // 每 1000 次请求打印一次进度
-        if (totalRequests % 1000 == 0) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - startTime).count();
-            std::cout << "\r[进度] 已发送 " << totalRequests << " 次请求，"
-                      << "用时 " << elapsed << " 秒" << std::flush;
-        }
+                // 随机选词
+                std::string word = pickRandomWord();
+                auto reqStart = std::chrono::steady_clock::now();
+
+                local.total++;
+                if (!client.sendSuggestQuery(word)) {
+                    local.failed++;
+                    continue;
+                }
+
+                std::string response = client.receiveResponse(10000);
+                auto reqEnd = std::chrono::steady_clock::now();
+
+                if (response.empty()) {
+                    local.failed++;
+                } else {
+                    local.success++;
+                    double ms = std::chrono::duration<double, std::milli>(reqEnd - reqStart).count();
+                    if (local.latencies.size() < 10000) {  // 最多记录 1 万条延迟
+                        local.latencies.push_back(ms);
+                    }
+                }
+            }
+
+            client.disconnect();
+
+            // 合并到全局
+            gTotal   += local.total;
+            gSuccess += local.success;
+            gFailed  += local.failed;
+            {
+                std::lock_guard<std::mutex> lock(latencyMutex);
+                allLatencies.insert(allLatencies.end(),
+                                    local.latencies.begin(),
+                                    local.latencies.end());
+            }
+        });
+    }
+
+    // 等待所有线程结束
+    for (auto& th : threads) {
+        if (th.joinable()) th.join();
     }
 
     auto actualDuration = std::chrono::duration_cast<std::chrono::duration<double>>(
         std::chrono::steady_clock::now() - startTime).count();
 
-    double qps = successRequests / actualDuration;
+    double qps = gSuccess / actualDuration;
 
-    std::cout << "\n\n══════════════════════════════════════════════════════════"
+    // 计算延迟统计
+    double avgLat = 0.0, p50 = 0.0, p90 = 0.0, p99 = 0.0, maxLat = 0.0;
+    if (!allLatencies.empty()) {
+        std::sort(allLatencies.begin(), allLatencies.end());
+        size_t n = allLatencies.size();
+        avgLat = std::accumulate(allLatencies.begin(), allLatencies.end(), 0.0) / n;
+        p50  = allLatencies[static_cast<size_t>(n * 0.50)];
+        p90  = allLatencies[static_cast<size_t>(n * 0.90)];
+        p99  = allLatencies[static_cast<size_t>(n * 0.99)];
+        maxLat = allLatencies.back();
+    }
+
+    // 打印结果
+    std::cout << "\n══════════════════════════════════════════════════════════"
               << std::endl;
-    std::cout << "  QPS 压测结果 (HTTP)" << std::endl;
+    std::cout << "  多线程 QPS 压测结果 (HTTP)" << std::endl;
     std::cout << "══════════════════════════════════════════════════════════"
               << std::endl;
-    std::cout << "  查询词:           \"" << query << "\"" << std::endl;
     std::cout << "  实际测试时长:      " << std::fixed << std::setprecision(2)
               << actualDuration << " 秒" << std::endl;
-    std::cout << "  总请求数:         " << totalRequests << std::endl;
-    std::cout << "  成功请求数:       " << successRequests << std::endl;
-    std::cout << "  失败请求数:       " << failedRequests << std::endl;
-    std::cout << "  QPS:              " << std::fixed << std::setprecision(2)
+    std::cout << "  总请求数:         " << gTotal.load() << std::endl;
+    std::cout << "  成功请求数:       " << gSuccess.load() << std::endl;
+    std::cout << "  失败请求数:       " << gFailed.load() << std::endl;
+    std::cout << "  ────────────────────────────────────────────" << std::endl;
+    std::cout << "  总 QPS:           " << std::fixed << std::setprecision(2)
               << qps << " 次/秒" << std::endl;
+    std::cout << "  ────────────────────────────────────────────" << std::endl;
+    std::cout << "  平均延迟:         " << std::fixed << std::setprecision(2)
+              << avgLat << " ms" << std::endl;
+    std::cout << "  P50 延迟:         " << std::fixed << std::setprecision(2)
+              << p50 << " ms" << std::endl;
+    std::cout << "  P90 延迟:         " << std::fixed << std::setprecision(2)
+              << p90 << " ms" << std::endl;
+    std::cout << "  P99 延迟:         " << std::fixed << std::setprecision(2)
+              << p99 << " ms" << std::endl;
+    std::cout << "  最大延迟:         " << std::fixed << std::setprecision(2)
+              << maxLat << " ms" << std::endl;
     std::cout << "══════════════════════════════════════════════════════════"
               << std::endl
               << std::endl;
-
-    client.disconnect();
 }
 
 // ============================================================
@@ -453,15 +559,24 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // QPS 压测命令
+        // QPS 压测命令：/qps [线程数] [秒数]
+        // 示例：/qps          → 10 线程, 20 秒
+        //        /qps 50      → 50 线程, 20 秒
+        //        /qps 30 60   → 30 线程, 60 秒
         if (input == "/qps" || input.substr(0, 5) == "/qps ") {
-            std::string query;
-            if (input == "/qps") {
-                query = "搜索引擎";
-            } else {
-                query = input.substr(5);
+            int numThreads = 10;
+            int durationSec = 20;
+            if (input != "/qps") {
+                std::string args = input.substr(5);
+                size_t space = args.find(' ');
+                if (space == std::string::npos) {
+                    numThreads = std::stoi(args);
+                } else {
+                    numThreads = std::stoi(args.substr(0, space));
+                    durationSec = std::stoi(args.substr(space + 1));
+                }
             }
-            runBenchmark(serverIp, serverPort, query, 20);
+            runBenchmark(serverIp, serverPort, numThreads, durationSec);
             continue;
         }
 

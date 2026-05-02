@@ -46,15 +46,7 @@ BertInferEngine::BertInferEngine(const std::string& model_path, const std::strin
         api_->SetSessionGraphOptimizationLevel(sess_opts_raw, ORT_ENABLE_ALL),
         "设置图优化级别失败");
 
-    // ---- 4. 加载模型 ----
-    OrtSession* session_raw = nullptr;
-    check_status(
-        api_->CreateSession(env_.get(), model_path.c_str(), sess_opts_raw, &session_raw),
-        "加载模型失败: " + model_path);
-    session_.reset(session_raw);
-    session_.get_deleter().api = api_;
-
-    // ---- 5. 创建 CPU MemoryInfo（用于创建输入张量） ----
+    // ---- 4. 创建 CPU MemoryInfo（用于创建输入张量） ----
     OrtMemoryInfo* mem_info_raw = nullptr;
     check_status(
         api_->CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault, &mem_info_raw),
@@ -62,7 +54,15 @@ BertInferEngine::BertInferEngine(const std::string& model_path, const std::strin
     mem_info_.reset(mem_info_raw);
     mem_info_.get_deleter().api = api_;
 
-    // ---- 6. 获取输入输出名称 ----
+    // ---- 5. 加载 ONNX 模型，创建主 Session ----
+    OrtSession* session_raw = nullptr;
+    check_status(
+        api_->CreateSession(env_.get(), model_path.c_str(), sess_opts_.get(), &session_raw),
+        "加载模型失败: " + model_path);
+    session_.reset(session_raw);
+    session_.get_deleter().api = api_;
+
+    // ---- 6. 获取输入输出张量名称 ----
     OrtAllocator* allocator = nullptr;
     check_status(
         api_->GetAllocatorWithDefaultOptions(&allocator),
@@ -120,7 +120,6 @@ void BertInferEngine::check_status(OrtStatus* status, const std::string& msg) {
 std::vector<float> BertInferEngine::encode_single(const std::string& text) {
     // ---- 1. 分词 ----
     std::vector<size_t> token_ids = tokenizer_.tokenize_full(text);
-    // tokenize_full 返回的 ids 包含 [CLS] 和 [SEP]
 
     // ---- 2. 截断到 max_len ----
     size_t actual_len = token_ids.size();
@@ -130,7 +129,7 @@ std::vector<float> BertInferEngine::encode_single(const std::string& text) {
         token_ids.push_back(102);  // [SEP] id
     }
 
-    // ---- 3. 填充缓冲区 ----
+    // ---- 3. 填充缓冲区（共享的，单线程使用） ----
     std::fill(input_ids_buf_.begin(),  input_ids_buf_.end(),  static_cast<int64_t>(0));
     std::fill(attn_mask_buf_.begin(),  attn_mask_buf_.end(),  static_cast<int64_t>(0));
     std::fill(token_type_buf_.begin(), token_type_buf_.end(), static_cast<int64_t>(0));
