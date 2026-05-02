@@ -43,6 +43,7 @@ set(SRCS
     ${PROJECT_SOURCE_DIR}/src/FileProcessor.cpp
     ${PROJECT_SOURCE_DIR}/src/InetAddress.cpp
     ${PROJECT_SOURCE_DIR}/src/InferEngine.cpp        # BERT 推理引擎
+    ${PROJECT_SOURCE_DIR}/src/IVFIndex.cpp            # IVF K-Means 聚类索引（ANN 加速）
     ${PROJECT_SOURCE_DIR}/src/main.cpp
     ${PROJECT_SOURCE_DIR}/src/mylog.cpp
     ${PROJECT_SOURCE_DIR}/src/PageLib.cpp

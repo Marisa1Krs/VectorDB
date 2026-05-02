@@ -44,21 +44,28 @@
 │  │  /suggest → SemanticIndexer     │                          │
 │  └─────────────────────────────────┘                          │
 │                                                              │
-│  ┌───────────────────────────────────────────────────┐       │
-│  │            SemanticIndexer (核心模块)                │       │
-│  │  ┌──────────────────┐  ┌────────────────────┐    │       │
-│  │  │ BertInferEngine   │  │     SQLite3 DB    │    │       │
-│  │  │ (ONNX Runtime)    │  │ docs表(id,title,  │    │       │
-│  │  │ model.onnx +      │  │ url,content,      │    │       │
-│  │  │ tokenizer.json    │  │ embedding BLOB,   │    │       │
-│  │  └──────────────────┘  │ title_embedding)   │    │       │
-│  │  ┌──────────────────┐  └────────────────────┘    │       │
-│  │  │ DictProducer      │                           │       │
-│  │  │ (jieba.dict.utf8) │                           │       │
-│  │  │ Levenshtein 编辑   │                           │       │
-│  │  │ 距离 → 降准匹配    │                           │       │
-│  │  └──────────────────┘                           │       │
-│  └───────────────────────────────────────────────────┘       │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │            SemanticIndexer (核心模块)                    │  │
+│  │  ┌──────────────────┐  ┌────────────────────┐         │  │
+│  │  │ BertInferEngine   │  │     SQLite3 DB    │         │  │
+│  │  │ (ONNX Runtime)    │  │ docs表(id,title,  │         │  │
+│  │  │ model.onnx +      │  │ url,content,      │         │  │
+│  │  │ tokenizer.json    │  │ embedding BLOB,   │         │  │
+│  │  └──────────────────┘  │ title_embedding,   │         │  │
+│  │  ┌──────────────────┐  │ cluster_id)        │         │  │
+│  │  │ IVFIndex          │  └────────────────────┘         │  │
+│  │  │ K-Means 聚类      │                                 │  │
+│  │  │ √ 训练: K-Means++ │                                 │  │
+│  │  │ √ 搜索: IVF nprobe│                                 │  │
+│  │  │ √ 持久化: 二进制   │                                 │  │
+│  │  └──────────────────┘                                 │  │
+│  │  ┌──────────────────┐                                 │  │
+│  │  │ DictProducer      │                                 │  │
+│  │  │ (jieba.dict.utf8) │                                 │  │
+│  │  │ Levenshtein 编辑   │                                 │  │
+│  │  │ 距离 → 降准匹配    │                                 │  │
+│  │  └──────────────────┘                                 │  │
+│  └────────────────────────────────────────────────────────┘  │
 │                                                              │
 │  ┌──────────────────┐  ┌──────────────────────┐              │
 │  │  WordPieceTokenizer│ │       Configer        │              │
@@ -99,19 +106,19 @@
           │            │  │  SELECT title_embedding       │   │
           ▼            │  │  dot product → top50          │   │
  ┌──────────────────┐  │  │  提取词语 → 归一化 score_bge  │   │
- │ SQLite 检索       │  │  └─────────────────────────────┘   │
- │ SELECT embedding  │  │              +                     │
- │ dot product       │  │  ┌─────────────────────────────┐   │
- │ sort Top-10       │  │  │ jieba 引擎 (DictProducer)   │   │
- └────────┬─────────┘  │  │  load jieba.dict.utf8        │   │
-          │            │  │  首字 + 长度过滤             │   │
-          ▼            │  │  Levenshtein 编辑距离        │   │
- ┌──────────────────┐  │  │  → score_jieba ∈ [0,1]      │   │
- │ JSON 裸数组       │  │  └─────────────────────────────┘   │
- │ [{title, url,    │  │              +                     │
- │   content,score}] │  │  ┌─────────────────────────────┐   │
- └──────────────────┘  │  │ 融合评分                      │   │
-                       │  │  final = 0.5×score_jieba     │   │
+ │ IVF + SQLite 检索   │  │  └─────────────────────────────┘   │
+ │ ① searchCentroids  │  │              +                     │
+ │ ② cluster_id IN () │  │  ┌─────────────────────────────┐   │
+ │ ③ dot product      │  │  │ jieba 引擎 (DictProducer)   │   │
+ │ ④ sort Top-10      │  │  │  load jieba.dict.utf8        │   │
+ └────────┬─────────┘  │  │  首字 + 长度过滤             │   │
+          │            │  │  Levenshtein 编辑距离        │   │
+          ▼            │  │  → score_jieba ∈ [0,1]      │   │
+ ┌──────────────────┐  │  └─────────────────────────────┘   │
+ │ JSON 裸数组       │  │              +                     │
+ │ [{title, url,    │  │  ┌─────────────────────────────┐   │
+ │   content,score}] │  │  │ 融合评分                      │   │
+ └──────────────────┘  │  │  final = 0.5×score_jieba     │   │
                        │  │        + 0.5×score_bge       │   │
                        │  │  sort Top-10                 │   │
                        │  └─────────────────────────────┘   │
@@ -162,12 +169,19 @@ search-engine/
 │   ├── InferEngine.h             # BERT 推理引擎
 │   │                            # - BertInferEngine 类：ONNX Runtime 封装
 │   │                            # - encode_single() / encode_batch()
+│   ├── IVFIndex.h                # IVF 倒排文件索引（K-Means 聚类加速）
+│   │                            # - K-Means++ 初始化（固定种子 42）
+│   │                            # - 迭代训练（最多 50 轮）直到收敛
+│   │                            # - 空簇处理（分裂噪声扰动）
+│   │                            # - nprobe 搜索（查询最近 nprobe 个簇）
+│   │                            # - 二进制持久化（load/save）
 │   ├── mylog.h                   # 日志系统
 │   ├── PageLib.h                 # 网页库
 │   ├── SemanticIndexer.h         # 语义索引器
 │   │                            # - SQLite 存储文档+embedding
 │   │                            # - buildIndex() / find() / suggest() / size()
 │   │                            # - suggest(): jieba(50%) + BGE(50%) 双引擎
+│   │                            # - find(): IVF 加速（K-Means 聚类过滤）
 │   ├── sqlite3.h                 # SQLite3 C API 头文件（amalgamation）
 │   ├── Socket.h / SockIO.h       # Socket 封装
 │   ├── Task.h                    # 任务封装
@@ -184,6 +198,7 @@ search-engine/
 │   ├── Configer.cpp              # 配置解析实现
 │   ├── DictProducer.cpp          # DictProducer 实现
 │   ├── InferEngine.cpp           # BertInferEngine 实现
+│   ├── IVFIndex.cpp              # IVFIndex 实现（K-Means 训练+搜索+持久化）
 │   ├── SemanticIndexer.cpp       # SemanticIndexer 实现
 │   ├── TcpServer.cpp             # 服务器网络层
 │   ├── TcpConnetion.cpp          # 连接管理
@@ -292,6 +307,7 @@ vocabPath:         # HuggingFace tokenizer.json 路径
 sqliteDbPath:      # SQLite 数据库文件路径
 jiebaDictPath:     # jieba 词典文件路径（dict/jieba.dict.utf8）
 logPath:           # 日志文件路径
+ivfIndexPath:      # IVF 索引文件路径（二进制持久化，自动创建）
 
 # ==================== 网络配置 ====================
 serverIp:          # 监听 IP 地址
@@ -357,11 +373,19 @@ Accept: application/json
 
 **实现**: [`SemanticIndexer::find()`](include/SemanticIndexer.h)
 
-搜索流程：
+**搜索模式**（根据是否已训练 IVF 自动选择）：
+
+| 模式 | 条件 | 性能 | 说明 |
+|------|------|------|------|
+| **IVF 加速** | IVF 索引文件存在 | O(K×dim + N×nprobe/K×dim) | K-Means 聚类过滤，仅扫描 nprobe 个最近簇 |
+| **全表扫描（降级）** | IVF 未训练或无文件 | O(N×dim) | 暴力遍历所有文档（首次建库回退） |
+
+搜索流程（IVF 加速模式）：
 1. 用 BERT 将查询编码为 512 维向量
-2. 从 SQLite 读取所有文档的 embedding
-3. 计算查询向量与每个文档向量的点积（余弦相似度）
-4. 按相似度降序排列，返回 Top-10
+2. 调用 [`IVFIndex::searchCentroids()`](include/IVFIndex.h) 找到最近的 nprobe 个簇
+3. 仅从这些簇中 `SELECT ... WHERE cluster_id IN (...)` 读取文档
+4. 计算查询向量与各文档向量的点积（余弦相似度）
+5. 按相似度降序排列，返回 Top-10
 
 ---
 
@@ -374,7 +398,7 @@ Accept: application/json
 **请求示例**:
 
 ```
-GET /suggest?q=%E4%B9%A0%E8%BF%91%E5%B9%B3 HTTP/1.1
+GET /suggest?q=%E6%90%9C%E7%B4%A2%E5%BC%95 HTTP/1.1
 Host: 127.0.0.1:8080
 Connection: keep-alive
 Accept: application/json
@@ -383,7 +407,7 @@ Accept: application/json
 **响应示例**:
 
 ```json
-["习近平", "习近平总书记", "习近平主席", "习近平新时代", "习近平思想"]
+["搜索引擎", "搜索引擎优化", "搜索引擎营销", "搜索技术", "搜索算法"]
 ```
 
 **双引擎评分机制**:
@@ -460,11 +484,39 @@ Accept: application/json
 
 - **实现文件**: [`include/SemanticIndexer.h`](include/SemanticIndexer.h)（声明） + [`src/SemanticIndexer.cpp`](src/SemanticIndexer.cpp)（实现）
 - **数据存储**: 使用 SQLite 数据库存储文档和 512 维稠密向量
-- **`buildIndex()`**: 遍历 XML 语料 → BERT 编码 → 事务批量写入 SQLite
-- **`find()`**: BERT 编码查询 → SQLite 全表扫描 → 向量点积 → TopK 排序
+- **`buildIndex()`**: 遍历 XML 语料 → BERT 编码 → 事务批量写入 SQLite → **训练 IVF K-Means 聚类 → 更新 cluster_id → 持久化 IVF 文件**
+- **`find()`**: BERT 编码查询 → **IVF 加速**（searchCentroids → cluster_id 过滤 → 向量点积 → TopK）或全表扫描降级
 - **`suggest()`**: **双引擎综合评分** — jieba 编辑距离(50%) + BGE 语义向量(50%) → 按综合分 TopK 返回
 - **内部包含 [`DictProducer`](include/DictProducer.h)**：加载 jieba 词典，提供 Levenshtein 编辑距离匹配
+- **内部包含 [`IVFIndex`](include/IVFIndex.h)**：K-Means 聚类加速向量检索
 - **单例模式**: 通过 `init()` + `getPtr()` 全局访问
+
+### [`IVFIndex`](include/IVFIndex.h) — IVF 分堆搜索（K-Means 聚类加速）
+
+- **实现文件**: [`include/IVFIndex.h`](include/IVFIndex.h)（声明） + [`src/IVFIndex.cpp`](src/IVFIndex.cpp)（实现）
+- **核心思路**: 把所有文章向量分成 K 堆，搜的时候只看最近的几堆，不用全看
+
+**简单说就是"分堆找东西"**：
+
+假设有一万篇文章，每篇都有一个 512 维的向量。搜的时候如果一篇篇比，太慢了。
+
+**K-Means 分堆过程**:
+1. **挑几个"组长"**：先随便挑 K 个点当"组长"（第一个随机挑，后面的尽量挑离已有点远的，这样组更分散）
+2. **组员归队**：每篇文章去找离它最近的组长，加入这个组
+3. **重选组长**：每个组算一个新组长（组内所有文章的平均位置）
+4. **反复调整**：重复第 2-3 步，直到没人换组为止（最多 50 轮）
+5. **特殊情况**：如果某个组没人了，从隔壁组复制一个队长加点随机抖动
+
+**搜索时（nprobe）**：
+- 查询词转成向量
+- 先算跟 K 个组长的距离，找出最近的几个组（默认 5 个）
+- 只看这几个组里的文章，不用全部扫描
+- 原来要看 N 篇 → 现在只看 N × nprobe / K 篇，快很多
+
+**存到文件**：
+- 训练好的分组信息可以存到文件里，下次启动直接读
+- 文件内容：[维度 | 组数 | 总数 | 组长坐标 | 每篇文章的归属]
+- 文件路径在 [`config/serch.conf`](config/serch.conf) 的 `ivfIndexPath` 里配置
 
 ### [`BertInferEngine`](include/InferEngine.h) — BERT 推理引擎
 
@@ -556,7 +608,14 @@ main()
   │       ├─ BertInferEngine::encode_single() → 512维向量（title）← title_embedding
   │       ├─ BEGIN TRANSACTION
   │       ├─ 逐条 INSERT INTO docs VALUES(?,?,?,?,?,?)
-  │       └─ COMMIT
+  │       ├─ COMMIT
+  │       │
+  │       ├─ (IVF 训练) ← 数据写入完成后自动训练
+  │       │   ├─ 读取所有 embedding 到内存
+  │       │   ├─ K = max(10, √N)   ← 自动选择簇数
+  │       │   ├─ IVFIndex::train(data, N, K)  ← K-Means++ 训练
+  │       │   ├─ UPDATE docs SET cluster_id = ?  ← 更新聚类分配
+  │       │   └─ IVFIndex::save(ivfIndexPath)   ← 持久化 IVF
   │
   ├─ g_serverReady = true          ← 服务器就绪，开始处理请求
   └─ serverThread.join()
@@ -588,11 +647,24 @@ handleHttpRequest(path, query, con)  ← 线程池异步处理
        │                 │     ├── WordPieceTokenizer::tokenize()
        │                 │     ├── ONNX Runtime 推理
        │                 │     └── L2 归一化 → 512维向量
-       │                 ├── SELECT id,title,url,content,embedding FROM docs
-       │                 ├── for each doc:
-       │                 │     score = dot(query_vec, doc_vec)
-       │                 ├── sort by score DESC
-       │                 └── return Top-10 JSON (裸数组)
+       │                 │
+       │                 ├── ivfTrained_ == true?       ← 判断 IVF 模式
+       │                 │      │
+       │                 │      ├── 是 → IVF 加速模式
+       │                 │      │   ├── IVFIndex::searchCentroids(query, nprobe)
+       │                 │      │   │     └── L2 距离 → partial_sort → 最近 nprobe 个簇
+       │                 │      │   ├── SELECT ... WHERE cluster_id IN (c1,c2,...)
+       │                 │      │   ├── for each doc:
+       │                 │      │   │     score = dot(query_vec, doc_vec)
+       │                 │      │   ├── sort by score DESC
+       │                 │      │   └── return Top-10 JSON (裸数组)
+       │                 │      │
+       │                 │      └── 否 → 全表扫描降级
+       │                 │          ├── SELECT ... FROM docs   ← 暴力遍历
+       │                 │          ├── for each doc:
+       │                 │          │     score = dot(query_vec, doc_vec)
+       │                 │          ├── sort by score DESC
+       │                 │          └── return Top-10 JSON (裸数组)
        │
        ├── path == "/suggest"?
        │      └── 是 → SemanticIndexer::suggest()
@@ -617,6 +689,104 @@ handleHttpRequest(path, query, con)  ← 线程池异步处理
        ▼
   con->sendInLoop(httpResponse)    ← 发送 HTTP 响应
 ```
+
+### 训练数据流（语料 ingestion）
+
+下面的流程图展示了原始语料文件如何一步步变成向量数据并训练 IVF 索引的全过程：
+
+```
+XML 语料文件（RSS feed）
+       │
+       ▼
+[ 文件扫描阶段 ]
+ DirScanner::traverse(data/doc/)
+       │
+       ├── 遍历 data/doc/ 目录下的所有 .xml/.html 文件
+       └── 生成文件路径列表 files[]
+       │
+       ▼
+[ 解析 & 清洗阶段 ]
+ stripHtml() 去除 HTML 标签
+       │
+       ├── 解析 XML 中的 <doc> 节点
+       ├── 提取 <title>、<url>、<content> 字段
+       └── tinyxml2 解析 + 正则清洗 HTML 标签
+       │
+       ▼
+[ BERT 编码阶段 ]
+ BertInferEngine::encode_single()
+       │
+       ├── WordPieceTokenizer::tokenize(text)
+       │     └── "慢性病" → [CLS] 慢 性 病 [SEP]
+       ├── ONNX Runtime 推理
+       │     └── 输入 shape [1, 128] token_ids → 输出 shape [1, 768]
+       ├── 取最后一层 hidden_state 的均值池化
+       │     └── 768维 → 维度压缩 → 512维向量
+       ├── L2 归一化 → 单位向量
+       │
+       ├──[content 分支] → content_embedding (512维)
+       └──[title 分支]   → title_embedding  (512维)
+       │
+       ▼
+[ SQLite 写入阶段 ]
+ 事务批量写入（提升性能）
+       │
+       ├── BEGIN TRANSACTION
+       ├── for each doc:
+       │     INSERT INTO docs
+       │       (title, url, content, embedding, title_embedding, cluster_id)
+       │       VALUES (?, ?, ?, ?, ?, NULL)
+       │     └── embedding / title_embedding 以 BLOB 形式存 RAW 二进制 float 数组
+       ├── COMMIT
+       └── 一次事务处理约 500~1000 条，避免 SQLite 频繁 fsync
+       │
+       ▼
+[ IVF 训练阶段 ]
+ 数据全部写入后，自动开始 K-Means 分堆训练
+       │
+       ├── 从 SQLite 读取所有 embedding（SELECT embedding FROM docs）
+       ├── 确定 K 值：K = max(10, √N)
+       │     └── 例如 N=10000 篇文档 → K = max(10, 100) = 100 堆
+       │
+       ├── 1. K-Means++ 初始化
+       │     ├── 第一个组长：随机选一个数据点（固定种子 seed=42）
+       │     └── 后面的组长：离已选组长越远的点越容易被选中
+       │
+       ├── 2. 分配（E 步）
+       │     ├── 每个向量跟所有组长比 L2 距离
+       │     └── 归入最近的组
+       │
+       ├── 3. 更新（M 步）
+       │     ├── 每组取所有成员坐标的平均值 → 新组长
+       │     └── 如果某组没人（空组），从邻居组复制并加微小噪声
+       │
+       ├── 4. 迭代 2↔3 直到稳定或达到最大 50 轮
+       │
+       ├── 5. 构建倒排列表
+       │     └── 记录每个组的成员编号
+       │
+       ├── 6. 回写 SQLite
+       │     └── UPDATE docs SET cluster_id = ? WHERE id = ?
+       │
+       └── 7. 持久化 IVF 文件
+             └── IVFIndex::save(ivfIndexPath)
+                   ├── 二进制格式：[dim | K | ntotal | centroids | assignments]
+                   └── 下次启动直接 load()，无需重新训练
+       │
+       ▼
+[ 服务器就绪 ]
+ g_serverReady = true
+       └── 开始接受客户端请求
+             ├── /search → IVF 加速模式
+             └── /suggest → 双引擎推荐
+```
+
+**关键说明**：
+
+- **首次启动**：如果 SQLite 是空的（`size() == 0`），会自动执行上面的完整训练流程，这个过程可能需要 1~5 分钟（取决于语料量）。
+- **再次启动**：如果已有 IVF 文件，直接 `load()` 跳过训练，秒级启动。
+- **增删语料**：当前设计暂不支持增量更新，如果需要添加新语料，删除 `data/` 目录下的数据库文件和 IVF 文件，重启服务即可重建。
+- **数据持久化**：embedding 存入 SQLite 后，下次即使没有 IVF 文件也能全表扫描搜索（降级模式），只是速度慢一些。
 
 ---
 
@@ -652,6 +822,72 @@ handleHttpRequest(path, query, con)  ← 线程池异步处理
    - `cos(θ) = (A·B) / (||A||·||B||) = A·B`
    - 即点积直接等于余弦相似度，无需额外除法
 4. **排序**：对所有文档计算 `score = query_emb · doc_emb`，取 TopK 最大值
+
+### IVF + K-Means 分堆搜索（近似最近邻）
+
+搜文章的时候，如果一篇篇比过去，文章越多越慢。
+
+换个思路：**先把文章分成几堆，搜的时候只看最近的几堆**。
+
+**打个比方**：
+> 图书馆有一万本书，你想找跟某本书类似的。
+> 笨办法：一本本翻，跟所有书都对比一遍。
+> IVF 的办法：先把书按内容分到 100 个书架上，搜的时候先看哪个书架最接近你的书，然后只翻这个书架上的书。
+
+**K-Means 分堆的步骤**：
+
+```
+输入：一万篇文章的向量，想分成 K 堆，最多调 50 轮
+输出：每堆有个"组长"坐标，每篇文章记下属于哪堆
+
+┌────────────────────────────────────────────┐
+│ ① 选组长（初始化）                          │
+│    - 固定随机种子 42，保证每次分堆结果一样     │
+│    - 第一个组长随便挑                        │
+│    - 后面的组长尽量挑离已有组长远的            │
+│      （这样各堆不会挤在一起）                  │
+├────────────────────────────────────────────┤
+│ ② 反复调整（最多 50 轮）：                   │
+│    a) 分派：每篇文章去找离它最近的组长         │
+│       如果某堆没人了 → 从隔壁复制一个加点抖动   │
+│    b) 更新：每堆算个新组长（组内文章的平均位置） │
+│    c) 检查：如果没人换组了 → 提前结束           │
+├────────────────────────────────────────────┤
+│ ③ 建目录：记下每篇文章属于哪堆                │
+└────────────────────────────────────────────┘
+```
+
+**nprobe 搜索过程**：
+
+```
+查询词 → 转成向量
+      │
+      ├── 算向量跟 K 个组长的距离
+      ├── 挑最近的 nprobe 个组（默认 5 个）
+      │
+      ▼
+┌────────────────────────────────────────┐
+│  只看这 5 个组里的文章                  │
+│  看的文章数 ≈ 总数 × 5 / K             │
+│  （原来看 10000 篇 → 现在看 ~500 篇）   │
+└────────────────────────────────────────┘
+      │
+      ├── 对这些文章算精确的相似度排序
+      └── 返回前 10 条结果
+
+性能对比（一万篇文章，分 100 堆，搜 5 个堆）：
+  - 原来：算 10000 次
+  - IVF：算 100 次（找堆）+ 500 次（堆里算分）= 600 次
+  - 快了大概 16 倍！
+```
+
+**重要参数**：
+
+| 参数 | 默认值 | 大白话 |
+|------|--------|--------|
+| K（堆数） | max(10, √文章数) | 文章越多堆越多，但不能超过总数一半 |
+| nprobe | 5 | 搜的时候看几个堆，越多越准但越慢 |
+| maxIter | 50 | 最多调几轮，够了就停 |
 
 ---
 

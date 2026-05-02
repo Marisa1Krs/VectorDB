@@ -3,50 +3,30 @@
 
 /**
  * @file SemanticIndexer.hpp
- * @brief 基于 BERT 句向量的语义搜索引擎（声明，SQLite 持久化）
+ * @brief 语义搜索引擎，把文章转成向量存到 SQLite，用 IVF 加速搜索
  *
- * ============================================================
- * 架构变更说明（对比原 PageLibPreprocessor 倒排索引）
- * ============================================================
+ * 简单说就是：
+ *   1. 文章 → BERT 模型 → 一串数字（叫"向量"，512 维）
+ *   2. 把向量存到 SQLite 数据库里
+ *   3. 搜的时候：查询词也转成向量 → 跟库里的向量比谁更"像"
+ *   4. 用 IVF 分堆搜索，不用全部文章都看一遍
  *
- * 【旧架构】（已删除）
- *   XML → jieba 分词 → TF-IDF → 倒排索引 (_invertIndex)
- *   → 写入 newripepage.dat（原始文件 I/O）
- *   → 查询时 jieba 分词 → 集合交集 → 余弦相似度
- *
- * 【新架构】
- *   XML → BERT 编码 → 512维句向量 → SQLite 数据库（BLOB 存储）
- *   → 查询时 BERT 编码 → SQLite 读取全部向量 → 点积排序 → TopK
- *
- * 【核心原理】
- *   1. BERT 模型将文本映射到 512 维语义向量空间
- *   2. 语义相似的文本在向量空间中距离更近
- *   3. 使用点积（等价于余弦相似度，因已 L2 归一化）度量相似度
- *   4. SQLite 替代原始文件 I/O，提供结构化存储和快速查询
- *
- * 【为何用 SQLite 替代文件 I/O】
- *   1. 结构化存储：字段分离（id/title/url/content/embedding）
- *   2. 原子写入：避免文件写入崩溃导致数据损坏
- *   3. 可查询：支持按条件过滤（未来可按分类、时间等查询）
- *   4. 跨平台：SQLite 是嵌入式数据库，无需服务进程
- *   5. 序列化无痛：BLOB 类型直接存储二进制向量
+ * 为什么用 SQLite 而不是文件：
+ *   - 字段分开存（标题/链接/内容/向量），好管理
+ *   - 写入时不会崩坏数据（原子写入）
+ *   - 可以按条件过滤（比如只看某个分类）
+ *   - 不需要额外装数据库软件，SQLite 是嵌入式的
  *
  * 使用示例：
  * @code
  *   SemanticIndexer::init("model/model.onnx", "model/tokenizer.json", conf);
- *   SemanticIndexer::getPtr()->buildIndex();        // 解析 XML → BERT 编码 → SQLite
- *   json results = SemanticIndexer::getPtr()->find("癌症治疗", 5);  // 语义搜索
+ *   SemanticIndexer::getPtr()->buildIndex();    // 建库：读 XML → BERT 编码 → 存 SQLite → 训练 IVF
+ *   json results = SemanticIndexer::getPtr()->find("癌症治疗", 5);  // 搜：编码 → IVF 找堆 → 算分排序
  * @endcode
- *
- * 依赖：
- *   - InferEngine.h（BERT 推理引擎）
- *   - DictProducer.h（jieba 词典编辑距离匹配）
- *   - tinyxml2（解析 XML 文档库）
- *   - sqlite3（嵌入式数据库，C API）
- *   - Configer（读取配置文件）
  */
 
 #include "InferEngine.h"
+#include "IVFIndex.h"
 #include "DictProducer.h"
 #include "Configer.h"
 #include "sqlite3.h"
@@ -65,28 +45,22 @@
 using json = nlohmann::json;
 
 // ============================================================
-// SemanticIndexer —— 基于 SQLite 持久化的语义搜索引擎
+// SemanticIndexer — 语义搜索引擎
 // ============================================================
 
 /**
- * @brief 语义搜索引擎，使用 BERT 模型 + SQLite 数据库
+ * @brief 负责：解析文章 → 转成向量 → 存 SQLite → 搜索时用 IVF 加速
  *
- * 替代原有的三件套：
- *   PageLibPreprocessor（倒排索引）+
- *   DictProducer（词典构建）+
- *   jieba（中文分词）
- *
- * 全部统一为一个 SemanticIndexer：
- *   文档解析 → BERT 编码 → SQLite 存储 → 向量检索
- *
- * SQLite 表结构：
+ * SQLite 里存的表结构：
  * @code
  *   CREATE TABLE IF NOT EXISTS docs (
  *       id        INTEGER PRIMARY KEY AUTOINCREMENT,
- *       title     TEXT,
- *       url       TEXT,
- *       content   TEXT,
- *       embedding BLOB     -- 512 float32 = 2048 bytes
+ *       title     TEXT,           -- 文章标题
+ *       url       TEXT,           -- 文章链接
+ *       content   TEXT,           -- 文章内容
+ *       embedding BLOB,           -- 文章内容向量（512个float32 = 2048字节）
+ *       title_embedding BLOB,     -- 标题向量（用于词语推荐）
+ *       cluster_id INTEGER        -- 文章属于 IVF 的哪个组（-1 表示未分组）
  *   );
  * @endcode
  */
@@ -103,15 +77,15 @@ public:
 
 public:
     /**
-     * @brief 构造语义搜索引擎
-     * @param model_path   ONNX 模型路径（如 "model/model.onnx"）
-     * @param vocab_path   tokenizer.json 路径（如 "model/tokenizer.json"）
-     * @param conf         配置器（用于读取 xmlPath, sqliteDbPath 等参数）
+     * @brief 构造函数
+     * @param model_path   BERT 模型文件路径（如 "model/model.onnx"）
+     * @param vocab_path   分词器配置路径（如 "model/tokenizer.json"）
+     * @param conf         配置器（从这里读各种路径设置）
      *
-     * 构造函数自动：
-     *   1. 初始化 BERT 推理引擎
-     *   2. 打开 SQLite 数据库（若不存在则创建）
-     *   3. 创建 docs 表结构
+     * 自动做三件事：
+     *   1. 加载 BERT 模型（准备把文字转成向量）
+     *   2. 打开 SQLite 数据库（没有就新建一个）
+     *   3. 创建 docs 表（存文章和向量）
      */
     SemanticIndexer(const string& model_path, const string& vocab_path, Configer& conf);
 
@@ -129,9 +103,9 @@ public:
     // ============================================================
 
     /**
-     * @brief 初始化语义搜索引擎单例
-     * @param model_path   ONNX 模型路径
-     * @param vocab_path   tokenizer.json 路径
+     * @brief 初始化单例（整个程序只一个搜索引擎实例）
+     * @param model_path   BERT 模型路径
+     * @param vocab_path   分词器配置路径
      * @param conf         配置器
      */
     static void init(const string& model_path, const string& vocab_path, Configer& conf);
@@ -144,20 +118,17 @@ public:
     // ============================================================
 
     /**
-     * @brief 从 XML 文件构建语义索引（持久化到 SQLite）
+     * @brief 建库：读 XML 文章 → BERT 转成向量 → 存 SQLite → 训练 IVF 分堆
      *
-     * 处理流程：
+     * 具体步骤：
      *   1. 扫描 xmlPath 目录下所有 XML 文件
-     *   2. 解析每个 RSS item（title + description + link）
-     *   3. 清洗 HTML 标签，解码 HTML 实体
-     *   4. 使用 BertInferEngine 编码为 512 维句向量
-     *   5. 将 title/url/content/embedding 写入 SQLite docs 表
-     *
-     * 底层原理：
-     *   - BERT 模型的 [CLS] 位置输出经过池化后作为句向量
-     *   - 句向量经过 L2 归一化，使点积 = 余弦相似度
-     *   - embedding 以 BLOB 格式存储（512 float32 = 2048 bytes）
-     *   - SQLite 事务确保批量写入的原子性和性能
+     *   2. 解析每个 RSS 条目（标题 + 内容 + 链接）
+     *   3. 去掉 HTML 标签
+     *   4. BERT 模型把文章转成 512 维向量
+     *   5. 批量写入 SQLite 数据库
+     *   6. 用 K-Means 算法把向量分成 K 堆（IVF 训练）
+     *   7. 每篇文章记下它在哪个堆里
+     *   8. 保存训练好的分组信息到文件
      */
     void buildIndex();
 
@@ -166,57 +137,54 @@ public:
     // ============================================================
 
     /**
-     * @brief 执行语义搜索
-     * @param query  用户查询字符串（UTF-8）
-     * @param topK   返回前 K 个结果（默认 10）
-     * @return json  搜索结果（格式兼容原 PageLibPreprocessor::find()）
+     * @brief 语义搜索：输入查询词，返回最像的 topK 篇文章
+     * @param query  用户输入的查询词（UTF-8 编码）
+     * @param topK   返回前几条结果（默认 10 条）
+     * @return json  搜索结果数组
      *
-     * 搜索流程：
-     *   1. 使用 BERT 对查询文本编码为 512 维向量
-     *   2. 从 SQLite 读取所有文档的 title/url/content/embedding
-     *   3. 计算查询向量与所有文档向量的点积（余弦相似度）
-     *   4. 按相似度降序排序
-     *   5. 返回 TopK 结果
+     * 搜索逻辑（有两种模式，自动选择）：
      *
-     * 底层原理：
-     *   - 由于所有向量已 L2 归一化，点积 = 余弦相似度
-     *   - 余弦相似度衡量两个向量方向的接近程度
-     *   - 相比 TF-IDF 关键词匹配，语义搜索能召回"同义词"和"相关概念"
+     * 【模式一：IVF 加速】（有 IVF 文件时）
+     *   1. BERT 把查询词转成 512 维向量
+     *   2. 看查询向量离哪几个"堆"最近（找最近的 nprobe 个组）
+     *   3. 只看这几个堆里的文章，不扫描全部
+     *   4. 算每篇文章向量和查询向量的"像不像"（点积 = 余弦相似度）
+     *   5. 按相似度从高到低排，返回前 topK 个
      *
-     * 性能说明：
-     *   - 每次查询需要从 SQLite 读取所有 embedding（全表扫描）
-     *   - 适用于文档数量在数万级别的场景
-     *   - 百万级以上需要 ANN（近似最近邻）索引如 FAISS
+     * 【模式二：全表扫描】（没有 IVF 文件时，兜底）
+     *   - 所有文章一一比对，虽然慢但保证能找到
+     *
+     * 性能对比（假设一万篇文章）：
+     *   - 全表扫：看 10000 篇
+     *   - IVF 加速：先看 100 个组找最近 → 再看最近 5 个组里的 ~500 篇
+     *   - 大约快 16 倍
      */
     json find(const string& query, int topK = 10);
 
     /**
-     * @brief 词语推荐（jieba 50% + BGE 50% 综合评分）
-     * @param query  用户输入的部分查询（UTF-8）
-     * @param topK   返回前 K 个推荐词（默认 10）
-     * @return json  推荐词语数组（JSON 字符串数组）
+     * @brief 词语推荐：查一个词，推荐跟它相关的词
+     * @param query  用户输入的关键词（UTF-8）
+     * @param topK   返回前几个推荐词（默认 10）
+     * @return json  推荐词列表（纯文本数组）
      *
-     * 实现原理（双引擎融合）：
-     *   1. jieba 引擎（50%）：遍历词典，Levenshtein 编辑距离 → 相似度 score_j
-     *   2. BGE 引擎（50%）：BERT 编码 → SQLite title_embedding ANN → 语义词提取 → score_b
-     *   3. 综合评分 = 0.5 × score_j + 0.5 × score_b
-     *   4. 按综合评分排序，返回 topK
-     *
-     * 设计思路：
-     *   - jieba：保证词汇级别的"长得像"（纠错、补全）
-     *   - BGE：保证语义级别的"意思像"（同义词、相关概念）
-     *   - 50/50 平衡，避免纯语义推荐太泛或纯编辑距离太死板
+     * 推荐逻辑（双引擎评分，各占一半）：
+     *   1. jieba 引擎（50%）：在词典里找字形相近的词（编辑距离）
+     *      比如搜"搜索引"能找到"搜索引擎"
+     *   2. BGE 引擎（50%）：BERT 找语义相近的标题里的词
+     *      比如搜"电脑"能找到"计算机"
+     *   3. 综合分 = jieba 分 × 0.5 + BGE 分 × 0.5
+     *   4. 按综合分排序，取前 topK 个
      */
     json suggest(const string& query, int topK = 10);
 
     /**
-     * @brief jieba 降准匹配（编辑距离模糊匹配）
-     * @param query  查询字符串
-     * @param topK   返回前 K 个
-     * @return json  模糊匹配的词数组（JSON 字符串数组）
+     * @brief jieba 模糊匹配：搜错了也能给你纠正
+     * @param query  用户输入的内容
+     * @param topK   返回前几个匹配词
+     * @return json  匹配到的词列表
      *
-     * 用于 /search 端点的"您是不是想找"提示。
-     * 底层调用 DictProducer::find()，基于 Levenshtein 编辑距离。
+     * 比如用户输入"搜索引"，能匹配到"搜索引擎"。
+     * 底层用的是编辑距离算法（Levenshtein）。
      */
     json jiebaSuggest(const string& query, int topK = 5) const;
 
@@ -234,10 +202,8 @@ public:
 
 private:
     // ============================================================
-    // 数据库统计
+    // 看看数据库里有多少数据
     // ============================================================
-
-    /// 检查数据库中的文档数量和其他统计信息
     void checkDbStats();
 
     // ============================================================
@@ -245,19 +211,18 @@ private:
     // ============================================================
 
     /**
-     * @brief 解码常用的 HTML 实体
+     * @brief 把 HTML 里的特殊符号转回正常字符
      *
-     * 将 "<", ">", "&", """, "'", "&nbsp;" 等
-     * HTML 实体替换为对应的字符。这些工具函数从原 PageLibPreprocessor
-     * 迁移至此，替代了 jieba 分词和 TF-IDF 处理。
+     * 比如 "<" 转成 "<"，"&" 转成 "&"
+     * 因为 XML 文章里有大量 HTML 编码，不转的话全是乱码
      */
     static string decodeHtmlEntities(const string& input);
 
     /**
-     * @brief 去除 HTML 标签，保留纯文本
+     * @brief 去掉 HTML 标签，只留纯文字
      *
-     * 简单的状态机：遇到 '<' 进入 tag 模式，遇到 '>' 退出。
-     * 标签结束后添加一个空格分隔文本。
+     * 原理很简单：看到 '<' 就忽略，直到看到 '>' 才恢复。
+     * 这样 "<p>你好</p>" 就变成了 "你好"
      */
     static string stripHtml(const string& input);
 
@@ -265,13 +230,19 @@ private:
     // 成员变量
     // ============================================================
 
-    BertInferEngine engine_;        ///< BERT 推理引擎（封装 ONNX Runtime）
-    Configer& _conf;                ///< 配置器引用（必须在 dictProducer_ 之前声明）
-    DictProducer dictProducer_;     ///< jieba 词典编辑距离匹配器（构造依赖 _conf）
-    sqlite3* db_;                   ///< SQLite 数据库连接指针
-    string _dbPath;                 ///< SQLite 数据库文件路径
+    BertInferEngine engine_;        ///< BERT 模型引擎（负责把文字转向量）
+    Configer& _conf;                ///< 配置器（读配置文件用）
+    DictProducer dictProducer_;     ///< jieba 词典匹配器（编辑距离模糊搜索）
+    sqlite3* db_;                   ///< SQLite 数据库连接
+    string _dbPath;                 ///< 数据库文件路径
 
-    inline static SemanticIndexer* _ptr = nullptr;  ///< 单例指针（C++17 inline static）
+    // ---- IVF 分堆搜索相关 ----
+    IVFIndex ivfIndex_;             ///< IVF 分堆索引（K-Means 聚类）
+    string ivfIndexPath_;           ///< IVF 索引文件存哪
+    bool ivfTrained_ = false;       ///< IVF 训练好了没（有文件就算训练好）
+    int ivfNprobe_ = 5;            ///< 搜索时看最近的几个堆（默认 5）
+
+    inline static SemanticIndexer* _ptr = nullptr;  ///< 单例指针（整个程序只有一份）
 };
 
 #endif // SEMANTIC_INDEXER_HPP

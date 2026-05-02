@@ -1,13 +1,11 @@
 /**
  * @file SemanticIndexer.cpp
- * @brief SemanticIndexer 实现 — 基于 BERT 句向量的语义搜索引擎（SQLite 持久化）
+ * @brief 语义搜索引擎的实现
  *
- * 实现细节：
- * 1. 构造函数：初始化 BERT 引擎 + 打开 SQLite 数据库 + 创建表结构
- * 2. buildIndex：解析 XML → BERT 编码 → SQLite 事务写入
- * 3. find：BERT 编码查询 → SQLite 全表扫描 → 点积排序 → TopK
- * 4. suggest：BERT 编码查询 → 逐标题编码 → 语义相似度排序 → 推荐
- * 5. 辅助工具：HTML 清洗、数据库统计、单例管理
+ * 主要功能：
+ * 1. 建库：读 XML 文章 → 转成向量 → 存 SQLite → 训练 IVF 分堆
+ * 2. 搜索：查询词转向量 → IVF 找最近的堆 → 堆里文章算分排序
+ * 3. 推荐：jieba 字形匹配(50%) + BGE 语义匹配(50%) → 综合排序
  */
 
 #include "SemanticIndexer.h"
@@ -17,7 +15,7 @@
 #include <cmath>
 
 // ============================================================
-// 构造函数 —— 初始化引擎 + 打开 SQLite 数据库
+// 构造函数 —— 初始化引擎 + 打开 SQLite 数据库 + 加载 IVF
 // ============================================================
 
 SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_path, Configer& conf)
@@ -25,18 +23,25 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
     , _conf(conf)
     , db_(nullptr)
     , dictProducer_(_conf.getConfigMap()["jiebaDictPath"])
+    , ivfIndex_(engine_.dim())  // IVF 也用 BERT 的维度（512 维）
 {
-    // 获取 SQLite 数据库路径（从配置）
+    // 读数据库路径，如果没有就默认放当前目录
     _dbPath = _conf.getConfigMap()["sqliteDbPath"];
     if (_dbPath.empty()) {
-        _dbPath = "semantic_index.db";  // 默认路径
+        _dbPath = "semantic_index.db";
     }
 
-    // ---- 打开 SQLite 数据库 ----
+    // 读 IVF 索引文件路径
+    ivfIndexPath_ = _conf.getConfigMap()["ivfIndexPath"];
+    if (ivfIndexPath_.empty()) {
+        ivfIndexPath_ = "data/ivf_index.bin";
+    }
+
+    // ---- 打开（或创建）SQLite 数据库 ----
     int rc = sqlite3_open_v2(
         _dbPath.c_str(),
         &db_,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,  // 读写，没有就创建
         nullptr
     );
     if (rc != SQLITE_OK) {
@@ -46,10 +51,10 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
     }
     LOG_INFO("SemanticIndexer: 打开数据库 %s", _dbPath.c_str());
 
-    // 设置忙等待超时（5秒），避免因 stale WAL 文件导致 SQLITE_BUSY
+    // 如果数据库正忙，最多等 5 秒
     sqlite3_busy_timeout(db_, 5000);
 
-    // ---- 创建表结构（含 title_embedding，用于 suggest 的 ANN） ----
+    // ---- 建表：存文章和向量 ----
     const char* createTableSQL =
         "CREATE TABLE IF NOT EXISTS docs ("
         "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -57,7 +62,8 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
         "  url             TEXT    NOT NULL DEFAULT '',"
         "  content         TEXT    NOT NULL DEFAULT '',"
         "  embedding       BLOB   NULL,"
-        "  title_embedding BLOB   NULL"
+        "  title_embedding BLOB   NULL,"
+        "  cluster_id      INTEGER DEFAULT -1"
         ");";
     char* errMsg = nullptr;
     rc = sqlite3_exec(db_, createTableSQL, nullptr, nullptr, &errMsg);
@@ -69,20 +75,45 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
                  engine_.dim(), engine_.max_seq_len());
     }
 
-    // ---- 兼容旧数据库：添加 title_embedding 列（如已存在则忽略） ----
-    // 旧数据库没有 title_embedding 列，需要 ALTER TABLE 添加
-    const char* alterSQL = "ALTER TABLE docs ADD COLUMN title_embedding BLOB NULL;";
-    rc = sqlite3_exec(db_, alterSQL, nullptr, nullptr, nullptr);
+    // ---- 兼容旧数据库：如果之前没有 title_embedding 列，加上 ----
+    const char* alterTitleSQL = "ALTER TABLE docs ADD COLUMN title_embedding BLOB NULL;";
+    rc = sqlite3_exec(db_, alterTitleSQL, nullptr, nullptr, nullptr);
     if (rc == SQLITE_OK) {
         LOG_INFO("SemanticIndexer: 已为旧数据库添加 title_embedding 列");
     } else {
-        // 列已存在的错误可忽略（SQLITE_ERROR 表示列已存在）
         if (rc != SQLITE_ERROR) {
-            LOG_WARN("SemanticIndexer: ALTER TABLE 添加 title_embedding 列: rc=%d", rc);
+            LOG_WARN("SemanticIndexer: ALTER TABLE title_embedding: rc=%d", rc);
         }
     }
 
-    // 检查是否已有数据
+    // ---- 兼容旧数据库：如果之前没有 cluster_id 列，加上 ----
+    const char* alterClusterSQL = "ALTER TABLE docs ADD COLUMN cluster_id INTEGER DEFAULT -1;";
+    rc = sqlite3_exec(db_, alterClusterSQL, nullptr, nullptr, nullptr);
+    if (rc == SQLITE_OK) {
+        LOG_INFO("SemanticIndexer: 已为旧数据库添加 cluster_id 列");
+    } else {
+        if (rc != SQLITE_ERROR) {
+            LOG_WARN("SemanticIndexer: ALTER TABLE cluster_id: rc=%d", rc);
+        }
+    }
+
+    // ---- 看看有没有之前训练好的 IVF 文件，有就直接加载 ----
+    std::ifstream ivfFile(ivfIndexPath_, std::ios::binary);
+    if (ivfFile.good()) {
+        ivfFile.close();
+        ivfIndex_.load(ivfIndexPath_);
+        if (ivfIndex_.size() > 0) {
+            ivfTrained_ = true;  // 标记 IVF 已可用
+            LOG_INFO("SemanticIndexer: 已加载现有 IVF 索引 (K=%d, ntotal=%d, dim=%d)",
+                     ivfIndex_.getK(), ivfIndex_.size(), ivfIndex_.getDim());
+        } else {
+            LOG_WARN("SemanticIndexer: IVF 索引文件存在但为空: %s", ivfIndexPath_.c_str());
+        }
+    } else {
+        LOG_INFO("SemanticIndexer: 未找到现有 IVF 索引，先用全表扫描模式（等 buildIndex 后会自动训练）");
+    }
+
+    // 看看数据库里有没有数据
     checkDbStats();
 
     LOG_INFO("SemanticIndexer: DictProducer 词典加载完成, 共 %zu 个词条",
@@ -116,14 +147,14 @@ SemanticIndexer* SemanticIndexer::getPtr() {
 }
 
 // ============================================================
-// 建索引 —— 从 XML 解析 → BERT 编码 → SQLite 存储
+// 建库：读 XML 文章 → BERT 转向量 → 存 SQLite → 训练 IVF 分堆
 // ============================================================
 
 void SemanticIndexer::buildIndex() {
     string xmlDir = _conf.getConfigMap()["xmlPath"];
     LOG_INFO("SemanticIndexer 开始构建索引，xmlDir=%s", xmlDir.c_str());
 
-    // ---- 1. 扫描 XML 文件 ----
+    // ---- 1. 扫描 xmlPath 目录下有哪些 XML 文件 ----
     std::vector<std::string> files;
     DIR* fileDir = opendir(xmlDir.c_str());
     if (!fileDir) {
@@ -251,44 +282,162 @@ void SemanticIndexer::buildIndex() {
         }
     }
 
-    // ---- 7. 提交事务 ----
+    // ---- 7. 全部写完，提交事务 ----
     sqlite3_finalize(insertStmt);
     sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
 
     LOG_INFO("SemanticIndexer: 索引构建完成，共 %d 篇文档写入 SQLite，每篇维度 %zu",
              totalDocs, engine_.dim());
 
-    // 输出数据库统计
     checkDbStats();
+
+    // ============================================================
+    // 8. 训练 IVF 分堆（K-Means 聚类）
+    //    以后搜索时就不用全部文章都看了
+    // ============================================================
+    if (totalDocs <= 0) {
+        LOG_WARN("SemanticIndexer: 没有文档，跳过 IVF 训练");
+        return;
+    }
+
+    // ---- 8a. 从 SQLite 读出所有文章的向量 ----
+    LOG_INFO("SemanticIndexer: 开始训练 IVF 分堆 (K-Means, %d 篇文档)", totalDocs);
+    const char* readEmbSQL = "SELECT id, embedding FROM docs ORDER BY id;";
+    sqlite3_stmt* embStmt = nullptr;
+    if (sqlite3_prepare_v2(db_, readEmbSQL, -1, &embStmt, nullptr) != SQLITE_OK) {
+        LOG_ERROR("SemanticIndexer: 读取向量失败: %s", sqlite3_errmsg(db_));
+        return;
+    }
+
+    size_t dim = engine_.dim();
+    std::vector<float> allEmbs(totalDocs * dim);  // 所有向量拼成一个大数组
+    std::vector<int> docIds(totalDocs);            // 每篇文章的 ID
+    int rowIdx = 0;
+
+    while (sqlite3_step(embStmt) == SQLITE_ROW) {
+        docIds[rowIdx] = sqlite3_column_int(embStmt, 0);  // 记下文章 ID
+        const void* blob = sqlite3_column_blob(embStmt, 1);
+        int nBytes = sqlite3_column_bytes(embStmt, 1);
+        int nFloats = nBytes / static_cast<int>(sizeof(float));
+        if (blob && nFloats > 0) {
+            size_t copySize = std::min(static_cast<size_t>(nFloats), dim);
+            std::memcpy(&allEmbs[rowIdx * dim], blob, copySize * sizeof(float));
+        }
+        ++rowIdx;
+    }
+    sqlite3_finalize(embStmt);
+
+    if (rowIdx != totalDocs) {
+        LOG_WARN("SemanticIndexer: 读到的文档数 %d 和预期 %d 不一样", rowIdx, totalDocs);
+        totalDocs = rowIdx;
+    }
+
+    // ---- 8b. 决定分几堆（K 值） ----
+    // 经验法则：大约 √N 堆，最多不超过总数的一半
+    int K = std::max(10, static_cast<int>(std::sqrt(static_cast<double>(totalDocs))));
+    K = std::min(K, totalDocs / 2);
+    if (K < 2) K = 2;
+
+    LOG_INFO("SemanticIndexer: IVF K=%d (sqrt(%d)=%d), nprobe=%d, dim=%zu",
+             K, totalDocs, (int)std::sqrt(totalDocs), ivfNprobe_, dim);
+
+    // ---- 8c. 开始 K-Means 训练（把向量分成 K 堆） ----
+    ivfIndex_ = IVFIndex(static_cast<int>(dim));
+    auto assignments = ivfIndex_.train(allEmbs.data(), totalDocs, K);
+
+    if (assignments.empty()) {
+        LOG_ERROR("SemanticIndexer: IVF 训练失败了，后面只能用全表扫描");
+        return;
+    }
+    LOG_INFO("SemanticIndexer: IVF 训练完成，K=%d, 共 %d 个向量", K, totalDocs);
+
+    // ---- 8d. 在数据库里记下每篇文章属于哪个堆 ----
+    const char* updateSQL = "UPDATE docs SET cluster_id = ? WHERE id = ?;";
+    sqlite3_stmt* updateStmt = nullptr;
+    if (sqlite3_prepare_v2(db_, updateSQL, -1, &updateStmt, nullptr) != SQLITE_OK) {
+        LOG_ERROR("SemanticIndexer: 预编译 UPDATE cluster_id 失败: %s", sqlite3_errmsg(db_));
+        return;
+    }
+
+    sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    for (int i = 0; i < totalDocs; ++i) {
+        sqlite3_bind_int(updateStmt, 1, assignments[i]);  // 堆编号
+        sqlite3_bind_int(updateStmt, 2, docIds[i]);        // 文章 ID
+        int rc = sqlite3_step(updateStmt);
+        if (rc != SQLITE_DONE) {
+            LOG_ERROR("SemanticIndexer: 更新 docId=%d cluster_id=%d 失败: rc=%d",
+                      docIds[i], assignments[i], rc);
+        }
+        sqlite3_reset(updateStmt);
+    }
+    sqlite3_finalize(updateStmt);
+    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
+
+    LOG_INFO("SemanticIndexer: 已为 %d 篇文档记录 cluster_id", totalDocs);
+
+    // ---- 8e. 把分堆结果存到文件，下次启动直接读 ----
+    ivfIndex_.save(ivfIndexPath_);
+    ivfTrained_ = true;  // 标记 IVF 已可用，以后搜索就用加速模式
+
+    LOG_INFO("SemanticIndexer: IVF 索引已保存到 %s (K=%d, ntotal=%d, dim=%d)",
+             ivfIndexPath_.c_str(), ivfIndex_.getK(), ivfIndex_.size(), ivfIndex_.getDim());
 }
 
 // ============================================================
-// 语义搜索
+// 语义搜索：输入查询词，返回最像的 topK 篇文章
 // ============================================================
 
 json SemanticIndexer::find(const string& query, int topK) {
     json ans = json::array();
 
     if (!db_) {
-        LOG_ERROR("SemanticIndexer: 数据库未打开");
+        LOG_ERROR("SemanticIndexer: 数据库没打开");
         return ans;
     }
 
-    // ---- 1. 对查询编码 ----
+    // ---- 1. 把查询词也转成向量 ----
     std::vector<float> queryEmb = engine_.encode(query);
 
-    // ---- 2. 从 SQLite 读取所有文档 ----
-    const char* selectSQL =
-        "SELECT id, title, url, content, embedding FROM docs;";
+    // ---- 2. 决定怎么查：有 IVF 就只看最近几个堆，没有就全表扫描 ----
+    std::string selectSQL;
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, selectSQL, -1, &stmt, nullptr) != SQLITE_OK) {
-        LOG_ERROR("SemanticIndexer: 查询失败: %s", sqlite3_errmsg(db_));
+
+    if (ivfTrained_) {
+        // ---- 模式A（IVF 加速）：先找最近的几个堆，只看堆里的文章 ----
+        auto nearestClusters = ivfIndex_.searchCentroids(queryEmb.data(), ivfNprobe_);
+
+        if (nearestClusters.empty()) {
+            LOG_ERROR("SemanticIndexer: IVF 搜索没找到任何堆");
+            return ans;
+        }
+
+        // 拼 SQL：WHERE cluster_id IN (3, 7, 12, ...)
+        // 意思是"只看第 3、7、12 这些堆里的文章"
+        std::string clusterList;
+        for (size_t i = 0; i < nearestClusters.size(); ++i) {
+            if (i > 0) clusterList += ",";
+            clusterList += std::to_string(nearestClusters[i].first);
+        }
+
+        selectSQL = "SELECT id, title, url, content, embedding FROM docs"
+                    " WHERE cluster_id IN (" + clusterList + ");";
+
+        LOG_INFO("SemanticIndexer: IVF 加速，只看 %zu 个堆 (%s)",
+                 nearestClusters.size(), clusterList.c_str());
+    } else {
+        // ---- 模式B（全表扫描）：没有 IVF，所有文章都看一遍（慢但全） ----
+        selectSQL = "SELECT id, title, url, content, embedding FROM docs;";
+        LOG_INFO("SemanticIndexer: 全表扫描模式（没有 IVF 索引）");
+    }
+
+    if (sqlite3_prepare_v2(db_, selectSQL.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        LOG_ERROR("SemanticIndexer: SQL 查询失败: %s", sqlite3_errmsg(db_));
         return ans;
     }
 
-    // 逐行读取并计算相似度
+    // 逐条读出来，算每篇跟查询词的"像不像"（点积 = 余弦相似度）
     std::vector<std::pair<float, DocRecord>> scoredDocs;
-    scoredDocs.reserve(10000);  // 预分配
+    scoredDocs.reserve(ivfTrained_ ? 5000 : 10000);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         DocRecord doc;
@@ -297,7 +446,7 @@ json SemanticIndexer::find(const string& query, int topK) {
         doc.url     = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
         doc.content = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
 
-        // 读取 embedding BLOB
+        // 读出存好的向量（2048 字节 = 512 个 float）
         const void* blob = sqlite3_column_blob(stmt, 4);
         int nBytes = sqlite3_column_bytes(stmt, 4);
         int nFloats = nBytes / static_cast<int>(sizeof(float));
@@ -306,11 +455,12 @@ json SemanticIndexer::find(const string& query, int topK) {
             std::memcpy(doc.embedding.data(), blob, static_cast<size_t>(nBytes));
         }
 
-        // ---- 3. 计算点积（余弦相似度） ----
+        // ---- 3. 算相似度：点积 = 余弦相似度 ----
+        // 因为所有向量都归一化了，直接点积就行
         float dot = 0.0f;
         size_t dim = std::min(queryEmb.size(), doc.embedding.size());
         for (size_t j = 0; j < dim; ++j) {
-            dot += queryEmb[j] * doc.embedding[j];
+            dot += queryEmb[j] * doc.embedding[j];  // 每个维度乘起来再加
         }
 
         scoredDocs.push_back({dot, std::move(doc)});
@@ -318,21 +468,21 @@ json SemanticIndexer::find(const string& query, int topK) {
     sqlite3_finalize(stmt);
 
     if (scoredDocs.empty()) {
-        LOG_WARN("SemanticIndexer: 数据库为空，请先调用 buildIndex()");
+        LOG_WARN("SemanticIndexer: 库里没有文章或堆里没东西，请先跑 buildIndex()");
         return ans;
     }
 
-    // ---- 4. 排序（取 TopK） ----
+    // ---- 4. 按相似度从高到低排序，取前 topK 个 ----
     std::partial_sort(
         scoredDocs.begin(),
         scoredDocs.begin() + std::min(topK, static_cast<int>(scoredDocs.size())),
         scoredDocs.end(),
         [](const std::pair<float, DocRecord>& a,
            const std::pair<float, DocRecord>& b) {
-            return a.first > b.first;
+            return a.first > b.first;  // 分数高的在前
         });
 
-    // ---- 5. 构建 JSON 结果 ----
+    // ---- 5. 组装成 JSON 返回 ----
     int resultCount = std::min(topK, static_cast<int>(scoredDocs.size()));
     for (int i = 0; i < resultCount; ++i) {
         const auto& doc = scoredDocs[i].second;
@@ -340,13 +490,14 @@ json SemanticIndexer::find(const string& query, int topK) {
         item["title"]      = doc.title;
         item["url"]        = doc.url;
         item["content"]    = doc.content;
-        item["similarity"] = scoredDocs[i].first;  // 余弦相似度值
+        item["similarity"] = scoredDocs[i].first;  // 相似度分数
         item["docId"]      = doc.docId;
         ans.push_back(std::move(item));
     }
 
-    LOG_INFO("SemanticIndexer: 查询 '%s' 返回 %d 条结果，top1 相似度=%f",
+    LOG_INFO("SemanticIndexer: 搜索 '%s' 返回 %d 条结果 (模式=%s)，最像的分数=%f",
              query.c_str(), resultCount,
+             ivfTrained_ ? "IVF加速" : "全表扫描",
              resultCount > 0 ? scoredDocs[0].first : 0.0);
 
     return ans;
