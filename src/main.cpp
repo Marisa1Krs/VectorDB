@@ -313,23 +313,7 @@ int main()
         server->start();
     });
 
-    // ============================================================
-    // 第二阶段：构建语义索引（替代原倒排索引 + 词典构建）
-    //
-    // 【变更说明】
-    // 原代码：
-    //   DictProducer::init(con);
-    //   DictProducer::getPtr()->buildEnDict();
-    //   DictProducer::getPtr()->buildCnDict();
-    //   PageLibPreprocessor::init(con);
-    //   PageLibPreprocessor::getPtr()->doProcess();
-    //
-    // 上述代码已被完全删除，原因：
-    //   - jieba 分词（DictProducer）被 BERT 模型替代
-    //   - 倒排索引（PageLibPreprocessor）被向量检索替代
-    //   - 不再需要构建中英文词典
-    //   - 不再需要 TF-IDF 计算
-    //
+
     // 新逻辑：
     //   1. 初始化 SemanticIndexer（打开 SQLite 数据库）
     //   2. 如果数据库为空，解析 XML → BERT 编码 → 写入 SQLite

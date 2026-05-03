@@ -1,7 +1,9 @@
 #ifndef ACCEPTOR_H
 #define ACCEPTOR_H
 #include<iostream>
-#include<allfun_of_linux.h>
+#include<string>
+#include<sys/socket.h>
+#include<unistd.h>
 #include"Socket.h"
 #include"InetAddress.h"
 #pragma once

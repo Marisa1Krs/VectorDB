@@ -13,16 +13,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # 指定头文件目录
-# 【变更说明】已删除 cppjieba、simhash 头文件目录
-# 原代码：
-#   ${PROJECT_SOURCE_DIR}/include/cppjieba
-#   ${PROJECT_SOURCE_DIR}/include/simhash
-# 上述两行已被删除，因为：
-#   - jieba 分词已被 BERT 模型替代
-#   - simhash 去重已被语义向量检索替代
+# 所有第三方库头文件统一放在 include/ 下
+#   include/              — 项目头文件
+#   include/json         — nlohmann/json
+#   include/cppjieba     — cppjieba 中文分词（用于 DictProducer 编辑距离匹配）
+#   include/limonp       — cppjieba 依赖的基础工具库
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/include/json
+    ${PROJECT_SOURCE_DIR}/include/cppjieba
+    ${PROJECT_SOURCE_DIR}/include/limonp
     ${PROJECT_SOURCE_DIR}/model/onnxruntime_lib/include  # ONNX Runtime C API
 )
 

@@ -1,6 +1,9 @@
 #ifndef SOCKIO_H
 #define SOCKIO_H
-#include<allfun_of_linux.h>
+#include<sys/socket.h>
+#include<unistd.h>
+#include<stdio.h>
+#include<errno.h>
 #pragma once
 
 class SockIO

@@ -1,7 +1,8 @@
 #ifndef INETADDRESS_H
 #define INETADDRESS_H
-#include<allfun_of_linux.h>
-#include<iostream>
+#include<string>
+#include<netinet/in.h>
+#include<arpa/inet.h>
 using std::string;
 class InetAddress
 {

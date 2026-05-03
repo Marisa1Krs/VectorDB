@@ -2,8 +2,12 @@
 #define EVENTLOOP_H
 
 #include"TcpConnetion.h"
-#include<allfun_of_c++.h>
-#include<allfun_of_linux.h>
+#include<vector>
+#include<map>
+#include<memory>
+#include<functional>
+#include<mutex>
+#include<sys/epoll.h>
 #include<sys/eventfd.h>
 #pragma once
 using std::vector;

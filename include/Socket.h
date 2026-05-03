@@ -1,6 +1,8 @@
 #ifndef SOCKET_H
 #define SOCKET_H
-#include<allfun_of_linux.h>
+#include<sys/socket.h>
+#include<unistd.h>
+#include<stdio.h>
 
 
 class Socket

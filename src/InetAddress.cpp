@@ -1,4 +1,6 @@
 #include "InetAddress.h"
+#include <cstring>
+#include <cstdlib>
 
 InetAddress::InetAddress(const string & ip,const string port)
 :ip(ip)

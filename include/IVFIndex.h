@@ -18,7 +18,7 @@
 
 #include <vector>
 #include <string>
-#include <utility>   // pair
+#include <utility>
 
 class IVFIndex {
 public:

@@ -2,8 +2,8 @@
 #define THREADPOOL_H
 
 #include<thread>
-#include<allfun_of_c++.h>
 #include<vector>
+#include<iostream>
 #include"taskQueue.h"
 #pragma once
 using std::vector;
