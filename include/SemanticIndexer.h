@@ -227,7 +227,7 @@ public:
      *   - IVF 加速：先看 100 个组找最近 → 再看最近 5 个组里的 ~500 篇
      *   - 大约快 16 倍
      */
-    json find(const string& query, int topK = 10);
+    json find(const string& query, int topK = -1);  // -1 表示返回全部结果
 
     /**
      * @brief 词语推荐：查一个词，推荐跟它相关的词

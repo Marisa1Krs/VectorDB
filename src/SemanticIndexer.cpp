@@ -577,19 +577,32 @@ json SemanticIndexer::find(const string& query, int topK) {
         return ans;
     }
 
-    // ---- 4. 按相似度从高到低排序，取前 topK 个 ----
-    std::partial_sort(
-        scoredDocs.begin(),
-        scoredDocs.begin() + std::min(topK, static_cast<int>(scoredDocs.size())),
-        scoredDocs.end(),
-        [](const std::pair<float, DocRecord>& a,
-           const std::pair<float, DocRecord>& b) {
-            return a.first > b.first;  // 分数高的在前
-        });
+    // ---- 4. 按相似度从高到低排序 ----
+    // topK == -1 表示返回全部结果；否则只取前 topK 个
+    int nTotal   = static_cast<int>(scoredDocs.size());
+    int nReturn  = (topK < 0 || topK >= nTotal) ? nTotal : topK;
+
+    if (nReturn >= nTotal) {
+        // 全部返回 → 全排序
+        std::sort(scoredDocs.begin(), scoredDocs.end(),
+            [](const std::pair<float, DocRecord>& a,
+               const std::pair<float, DocRecord>& b) {
+                return a.first > b.first;
+            });
+    } else {
+        // 只取前 topK 个 → partial_sort 更快 O(N log K)
+        std::partial_sort(
+            scoredDocs.begin(),
+            scoredDocs.begin() + nReturn,
+            scoredDocs.end(),
+            [](const std::pair<float, DocRecord>& a,
+               const std::pair<float, DocRecord>& b) {
+                return a.first > b.first;
+            });
+    }
 
     // ---- 5. 组装成 JSON 返回 ----
-    int resultCount = std::min(topK, static_cast<int>(scoredDocs.size()));
-    for (int i = 0; i < resultCount; ++i) {
+    for (int i = 0; i < nReturn; ++i) {
         const auto& doc = scoredDocs[i].second;
         json item;
         item["title"]      = doc.title;
@@ -600,10 +613,10 @@ json SemanticIndexer::find(const string& query, int topK) {
         ans.push_back(std::move(item));
     }
 
-    LOG_INFO("SemanticIndexer: 搜索 '%s' 返回 %d 条结果 (模式=%s)，最像的分数=%f",
-             query.c_str(), resultCount,
+    LOG_INFO("SemanticIndexer: 搜索 '%s' 返回 %d 条结果 (topK=%d, 模式=%s)，最像的分数=%f",
+             query.c_str(), nReturn, topK,
              ivfTrained_ ? "IVF加速" : "全表扫描",
-             resultCount > 0 ? scoredDocs[0].first : 0.0);
+             nReturn > 0 ? scoredDocs[0].first : 0.0);
 
     // ---- 6. 把结果写入 LFU 缓存，下次同样的查询直接秒回 ----
     searchCache_.put(query, ans);

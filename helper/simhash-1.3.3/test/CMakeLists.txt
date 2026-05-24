@@ -1,4 +1,0 @@
-SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/test)
-
-ADD_EXECUTABLE(load_test load_test.cpp)
-ADD_SUBDIRECTORY(unittest)

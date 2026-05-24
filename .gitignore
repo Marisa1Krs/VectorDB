@@ -76,3 +76,7 @@ data/semantic_index.db-shm
 # Runtime data files
 data/doc/problem
 data/newripepage.dat
+data/
+
+# Build index package (WSL2 CUDA index builder)
+build_index_pkg/
