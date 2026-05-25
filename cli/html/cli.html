@@ -205,7 +205,8 @@
     </div>
 
     <script>
-        const API_BASE = 'http://192.168.159.129:8080';
+        // 使用相对路径（前端页面由同一 C++ 服务器提供，避免 CORS 跨域问题）
+        const API_BASE = '';
         
         const input = document.getElementById('search-input');
         const suggestBox = document.getElementById('suggest-box');

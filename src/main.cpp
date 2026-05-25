@@ -263,10 +263,13 @@ void onClose(const shared_ptr<TcpConnetion> &con)
     cout << "链接已经关闭" << endl;
 }
 
-int main()
+int main(int argc, char* argv[])
 {
-    // 配置文件路径（唯一保留的硬编码路径，作为配置入口）
-    string confPath = "/home/marisa/code1/VectorDB/config/serch.conf";
+    // 配置文件路径：支持命令行参数指定，默认相对当前工作目录
+    string confPath = "config/serch.conf";
+    if (argc >= 2) {
+        confPath = argv[1];
+    }
     Configer con(confPath);
     auto& cfg = con.getConfigMap();
 
@@ -277,9 +280,10 @@ int main()
     mylog::init(logPath, logBufSize, static_cast<LogLevel>(logLevel));
 
     // 加载静态 HTML 页面到内存缓存
-    string htmlPath = confPath.substr(0, confPath.rfind('/'));
-    htmlPath = htmlPath.substr(0, htmlPath.rfind('/'));
-    htmlPath += "/cli/html/cli.html";
+    string htmlPath = cfg["htmlPagePath"];
+    if (htmlPath.empty()) {
+        htmlPath = "cli/html/cli.html";  // 默认相对当前工作目录
+    }
     std::ifstream ifs(htmlPath);
     if (ifs) {
         g_staticHtmlContent.assign(

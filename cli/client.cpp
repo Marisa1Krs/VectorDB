@@ -503,8 +503,9 @@ void runBenchmark(const std::string& serverIp, unsigned short serverPort,
 // 主函数
 // ============================================================
 int main(int argc, char* argv[]) {
-    // 解析命令行参数
-    std::string serverIp = "192.168.159.129";
+    // 解析命令行参数：./client [ip] [port]
+    // 默认连接本机（127.0.0.1:8080），通用默认值
+    std::string serverIp = "127.0.0.1";
     unsigned short serverPort = 8080;
 
     if (argc >= 2) {
