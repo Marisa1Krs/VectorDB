@@ -11,7 +11,7 @@
  * 2. 建库：每篇文章归到离它最近的组
  * 3. 查询：先找离查询词最近的 nprobe 个组 → 只看这几个组里的文章
  *
- * 适用于 512 维 BERT 向量的近似搜索（不精确但快很多）。
+ * 适用于 768 维 BERT 向量的近似搜索（不精确但快很多）。
  */
 
 #pragma once
@@ -22,7 +22,7 @@
 
 class IVFIndex {
 public:
-    explicit IVFIndex(int dim = 512);
+    explicit IVFIndex(int dim = 768);
     ~IVFIndex() = default;
 
     // 禁止拷贝
@@ -73,7 +73,7 @@ public:
     int size()   const { return ntotal_; }
 
 private:
-    int dim_;                             // 每个向量的维度（512）
+    int dim_;                             // 每个向量的维度（768）
     int K_;                               // 分成几个组
     int ntotal_ = 0;                      // 总共有多少个向量
 

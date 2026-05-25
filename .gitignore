@@ -80,3 +80,4 @@ data/
 
 # Build index package (WSL2 CUDA index builder)
 build_index_pkg/
+m3e-base-onnx/

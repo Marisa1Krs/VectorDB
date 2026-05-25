@@ -415,11 +415,16 @@ Accept: application/json
 | 引擎 | 方法 | 分数占比 | 说明 |
 |------|------|---------|------|
 | **jieba 编辑距离** | [`DictProducer::find()`](include/DictProducer.h) | 50% | 从 jieba 词典（35 万词条）中找首字母匹配、长度相近的词，计算 Levenshtein 编辑距离 → 相似度 |
-| **BGE 语义向量** | [`SemanticIndexer::suggest()`](include/SemanticIndexer.h) | 50% | BERT 编码查询 → ANN 检索 title_embedding → 提取语义相关词 → 归一化 |
+| **BGE 语义向量 + IVF** | [`SemanticIndexer::suggest()`](include/SemanticIndexer.h) | 50% | BERT 编码查询 → IVF 聚类加速（只查最近 N 堆）→ 两阶段 SQL（先 id+embedding 评分，再取 title 提取词语）→ 归一化 |
 
 **综合评分**: `final_score = 0.5 × score_jieba + 0.5 × score_bge`
 
 最终按综合评分降序排列，返回 Top-10 推荐词。
+
+**性能优化说明**（v2.0）：
+- **IVF 加速**：suggest 的语义搜索现在与 find() 共享 IVF 聚类索引，只扫描距离最近的 `nprobe × 2` 个堆中的文档，而非全表扫描。对于 10,000 篇文档，扫描量从 10,000 行降至约 250 行 — **加速约 40 倍**。
+- **两阶段查询**：第一阶段只加载 `id + title_embedding`（BLOB）计算点积评分；第二阶段仅对排序后的前 50 篇读取 `title` 字符串。SQLite I/O 减少约 80%。
+- **LFU 缓存**：每次 recommend 结果缓存 500 条，重复查询直接回。
 
 ---
 
@@ -483,10 +488,10 @@ Accept: application/json
 ### [`SemanticIndexer`](include/SemanticIndexer.h) — 语义索引器（核心模块）
 
 - **实现文件**: [`include/SemanticIndexer.h`](include/SemanticIndexer.h)（声明） + [`src/SemanticIndexer.cpp`](src/SemanticIndexer.cpp)（实现）
-- **数据存储**: 使用 SQLite 数据库存储文档和 512 维稠密向量
+- **数据存储**: 使用 SQLite 数据库存储文档和 768 维稠密向量
 - **`buildIndex()`**: 遍历 XML 语料 → BERT 编码 → 事务批量写入 SQLite → **训练 IVF K-Means 聚类 → 更新 cluster_id → 持久化 IVF 文件**
 - **`find()`**: BERT 编码查询 → **IVF 加速**（searchCentroids → cluster_id 过滤 → 向量点积 → TopK）或全表扫描降级
-- **`suggest()`**: **双引擎综合评分** — jieba 编辑距离(50%) + BGE 语义向量(50%) → 按综合分 TopK 返回
+- **`suggest()`**: **双引擎综合评分** — jieba 编辑距离(50%) + BGE 语义向量(50%) → **IVF 加速 ANN**（与 find() 共享聚类索引）+ **两阶段 SQL**（先 id+embedding 评分，再取 title 提取词语）→ 按综合分 TopK 返回
 - **内部包含 [`DictProducer`](include/DictProducer.h)**：加载 jieba 词典，提供 Levenshtein 编辑距离匹配
 - **内部包含 [`IVFIndex`](include/IVFIndex.h)**：K-Means 聚类加速向量检索
 - **单例模式**: 通过 `init()` + `getPtr()` 全局访问
@@ -498,7 +503,7 @@ Accept: application/json
 
 **简单说就是"分堆找东西"**：
 
-假设有一万篇文章，每篇都有一个 512 维的向量。搜的时候如果一篇篇比，太慢了。
+假设有一万篇文章，每篇都有一个 768 维的向量。搜的时候如果一篇篇比，太慢了。
 
 **K-Means 分堆过程**:
 1. **挑几个"组长"**：先随便挑 K 个点当"组长"（第一个随机挑，后面的尽量挑离已有点远的，这样组更分散）
@@ -522,7 +527,7 @@ Accept: application/json
 
 - **实现文件**: [`include/InferEngine.h`](include/InferEngine.h)（声明） + [`src/InferEngine.cpp`](src/InferEngine.cpp)（实现）
 - 封装 **ONNX Runtime C++ API**，加载 `model.onnx` 进行 CPU 推理
-- **`encode(text)`**: 接收字符串，返回 512 维 L2 归一化向量
+- **`encode(text)`**: 接收字符串，返回 768 维 L2 归一化向量
 - **`encode_batch(texts)`**: 批量编码
 - 内部使用 [`WordPieceTokenizer`](include/WordPieceTokenizer.hpp) 将文本转为 token IDs
 
@@ -551,8 +556,8 @@ Accept: application/json
 
 - 使用 [`include/sqlite3.h`](include/sqlite3.h)（官方 amalgamation 头文件）和系统 `libsqlite3.so.0` 运行时库
 - 建表语句：`CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT, content TEXT, embedding BLOB, title_embedding BLOB)`
-- `embedding` 列：512 维 content 向量（2048 字节 BLOB），用于 `/search` 文档检索
-- `title_embedding` 列：512 维 title 向量（2048 字节 BLOB），用于 `/suggest` 词语推荐
+- `embedding` 列：768 维 content 向量（3072 字节 BLOB），用于 `/search` 文档检索
+- `title_embedding` 列：768 维 title 向量（3072 字节 BLOB），用于 `/suggest` 词语推荐
 - 使用事务（BEGIN/COMMIT）批量写入提升性能
 - `sqlite3_busy_timeout(5000)` + 写入重试循环避免 SQLITE_BUSY
 

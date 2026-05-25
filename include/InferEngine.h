@@ -10,7 +10,7 @@
  * （C++17 特性），因此本项目需要使用 C++17 编译。
  *
  * 本文件提供：
- * 1. BertInferEngine —— 加载 model.onnx，执行 BERT 推理，返回 512 维句向量
+ * 1. BertInferEngine —— 加载 model.onnx，执行 BERT 推理，返回 768 维句向量
  * 2. 自动处理 tokenize、padding、mean pooling、L2 归一化
  *
  * 依赖：
@@ -38,7 +38,7 @@
 static const size_t BERT_MAX_SEQ_LEN = 512;
 
 /// BERT 隐藏层维度（来自 config.json hidden_size）
-static const size_t BERT_HIDDEN_SIZE = 512;
+static const size_t BERT_HIDDEN_SIZE = 768;
 
 // ============================================================
 // BertInferEngine —— BERT 模型推理引擎
@@ -58,7 +58,7 @@ static const size_t BERT_HIDDEN_SIZE = 512;
  * @code
  *   BertInferEngine engine("model/model.onnx", "model/tokenizer.json");
  *   std::vector<float> emb = engine.encode("你好世界");
- *   // emb.size() == 512
+ *   // emb.size() == 768
  * @endcode
  *
  * @note 必须使用 C++17 或更高版本编译（ONNX Runtime 1.25.1 要求）
@@ -92,9 +92,9 @@ public:
     // ============================================================
 
     /**
-     * @brief 将文本编码为 512 维句向量
+     * @brief 将文本编码为 768 维句向量
      * @param text  输入文本（UTF-8 编码）
-     * @return std::vector<float>  L2 归一化后的 512 维句向量
+     * @return std::vector<float>  L2 归一化后的 768 维句向量
      *
      * 流程：Tokenizer → Padding → BERT 推理 → Mean Pooling → L2 归一化
      */
@@ -103,7 +103,7 @@ public:
     /**
      * @brief 批量编码多段文本
      * @param texts  输入文本数组
-     * @return std::vector<std::vector<float>>  每个文本对应的 512 维句向量
+     * @return std::vector<std::vector<float>>  每个文本对应的 768 维句向量
      */
     std::vector<std::vector<float>> encode_batch(const std::vector<std::string>& texts);
 

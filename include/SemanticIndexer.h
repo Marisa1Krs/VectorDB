@@ -6,7 +6,7 @@
  * @brief 语义搜索引擎，把文章转成向量存到 SQLite，用 IVF 加速搜索
  *
  * 简单说就是：
- *   1. 文章 → BERT 模型 → 一串数字（叫"向量"，512 维）
+ *   1. 文章 → BERT 模型 → 一串数字（叫"向量"，768 维）
  *   2. 把向量存到 SQLite 数据库里
  *   3. 搜的时候：查询词也转成向量 → 跟库里的向量比谁更"像"
  *   4. 用 IVF 分堆搜索，不用全部文章都看一遍
@@ -126,7 +126,7 @@ private:
  *       title     TEXT,           -- 文章标题
  *       url       TEXT,           -- 文章链接
  *       content   TEXT,           -- 文章内容
- *       embedding BLOB,           -- 文章内容向量（512个float32 = 2048字节）
+ *       embedding BLOB,           -- 文章内容向量（768个float32 = 3072字节）
  *       title_embedding BLOB,     -- 标题向量（用于词语推荐）
  *       cluster_id INTEGER        -- 文章属于 IVF 的哪个组（-1 表示未分组）
  *   );
@@ -140,7 +140,7 @@ public:
         string  title;      ///< 文档标题
         string  url;        ///< 文档 URL
         string  content;    ///< 文档纯文本内容（已清洗 HTML）
-        std::vector<float> embedding;  ///< 512 维句向量（已 L2 归一化）
+        std::vector<float> embedding;  ///< 768 维句向量（已 L2 归一化）
     };
 
 public:
@@ -192,7 +192,7 @@ public:
      *   1. 扫描 xmlPath 目录下所有 XML 文件
      *   2. 解析每个 RSS 条目（标题 + 内容 + 链接）
      *   3. 去掉 HTML 标签
-     *   4. BERT 模型把文章转成 512 维向量
+     *   4. BERT 模型把文章转成 768 维向量
      *   5. 批量写入 SQLite 数据库
      *   6. 用 K-Means 算法把向量分成 K 堆（IVF 训练）
      *   7. 每篇文章记下它在哪个堆里
@@ -213,7 +213,7 @@ public:
      * 搜索逻辑（有两种模式，自动选择）：
      *
      * 【模式一：IVF 加速】（有 IVF 文件时）
-     *   1. BERT 把查询词转成 512 维向量
+     *   1. BERT 把查询词转成 768 维向量
      *   2. 看查询向量离哪几个"堆"最近（找最近的 nprobe 个组）
      *   3. 只看这几个堆里的文章，不扫描全部
      *   4. 算每篇文章向量和查询向量的"像不像"（点积 = 余弦相似度）

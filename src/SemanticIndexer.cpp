@@ -11,6 +11,7 @@
 #include "SemanticIndexer.h"
 
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <cmath>
 
@@ -104,7 +105,7 @@ SemanticIndexer::SemanticIndexer(const string& model_path, const string& vocab_p
     , _conf(conf)
     , db_(nullptr)
     , dictProducer_(_conf.getConfigMap()["jiebaDictPath"])
-    , ivfIndex_(engine_.dim())  // IVF 也用 BERT 的维度（512 维）
+    , ivfIndex_(engine_.dim())  // IVF 也用 BERT 的维度（768 维）
 {
     // 读数据库路径，如果没有就默认放当前目录
     _dbPath = _conf.getConfigMap()["sqliteDbPath"];
@@ -272,8 +273,8 @@ void SemanticIndexer::buildIndex() {
     sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
 
     // ---- 3. 预编译 INSERT 语句 ----
-    // embedding 列存储 512 个 float32（2048 字节）的 BLOB
-    // title_embedding 也存储 512 个 float32，用于 suggest 的 ANN 匹配
+    // embedding 列存储 768 个 float32（3072 字节）的 BLOB
+    // title_embedding 也存储 768 个 float32，用于 suggest 的 ANN 匹配
     const char* insertSQL =
         "INSERT INTO docs (title, url, content, embedding, title_embedding) "
         "VALUES (?, ?, ?, ?, ?);";
@@ -335,7 +336,7 @@ void SemanticIndexer::buildIndex() {
             sqlite3_bind_text(insertStmt, 1, title.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(insertStmt, 2, url.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(insertStmt, 3, cleanText.c_str(), -1, SQLITE_TRANSIENT);
-            // embedding 作为 BLOB：512 float32 = 2048 bytes
+            // embedding 作为 BLOB：768 float32 = 3072 bytes
             sqlite3_bind_blob(insertStmt, 4, emb.data(),
                               static_cast<int>(emb.size() * sizeof(float)),
                               SQLITE_TRANSIENT);
@@ -429,8 +430,10 @@ void SemanticIndexer::buildIndex() {
     }
 
     // ---- 8b. 决定分几堆（K 值） ----
-    // 经验法则：大约 √N 堆，最多不超过总数的一半
-    int K = std::max(10, static_cast<int>(std::sqrt(static_cast<double>(totalDocs))));
+    // 优化：K = 4 * √N，分更多堆 → 每堆更小 → 搜索时扫描更少文档
+    // 例如原来 10000 篇分 100 堆（每堆 ~100 篇），现在分 400 堆（每堆 ~25 篇）
+    // 搜索时只看 nprobe=5 个堆 → 从扫 500 篇降到扫 125 篇，快 4 倍
+    int K = std::max(20, static_cast<int>(4.0 * std::sqrt(static_cast<double>(totalDocs))));
     K = std::min(K, totalDocs / 2);
     if (K < 2) K = 2;
 
@@ -503,8 +506,9 @@ json SemanticIndexer::find(const string& query, int topK) {
     // ---- 1. 把查询词也转成向量 ----
     std::vector<float> queryEmb = engine_.encode(query);
 
-    // ---- 2. 决定怎么查：有 IVF 就只看最近几个堆，没有就全表扫描 ----
-    std::string selectSQL;
+    // ---- 2. 第一阶段 SQL：只查 id + embedding（不加载 content，节省 I/O） ----
+    // content 可能很大（整篇文章），先只读向量算分，最后再取前 topK 篇的完整数据
+    std::string phase1SQL;
     sqlite3_stmt* stmt = nullptr;
 
     if (ivfTrained_) {
@@ -517,106 +521,125 @@ json SemanticIndexer::find(const string& query, int topK) {
         }
 
         // 拼 SQL：WHERE cluster_id IN (3, 7, 12, ...)
-        // 意思是"只看第 3、7、12 这些堆里的文章"
         std::string clusterList;
         for (size_t i = 0; i < nearestClusters.size(); ++i) {
             if (i > 0) clusterList += ",";
             clusterList += std::to_string(nearestClusters[i].first);
         }
 
-        selectSQL = "SELECT id, title, url, content, embedding FROM docs"
+        // 第一阶段只查 id + embedding，不加载 title/url/content
+        phase1SQL = "SELECT id, embedding FROM docs"
                     " WHERE cluster_id IN (" + clusterList + ");";
 
         LOG_INFO("SemanticIndexer: IVF 加速，只看 %zu 个堆 (%s)",
                  nearestClusters.size(), clusterList.c_str());
     } else {
         // ---- 模式B（全表扫描）：没有 IVF，所有文章都看一遍（慢但全） ----
-        selectSQL = "SELECT id, title, url, content, embedding FROM docs;";
+        phase1SQL = "SELECT id, embedding FROM docs;";
         LOG_INFO("SemanticIndexer: 全表扫描模式（没有 IVF 索引）");
     }
 
-    if (sqlite3_prepare_v2(db_, selectSQL.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db_, phase1SQL.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         LOG_ERROR("SemanticIndexer: SQL 查询失败: %s", sqlite3_errmsg(db_));
         return ans;
     }
 
-    // 逐条读出来，算每篇跟查询词的"像不像"（点积 = 余弦相似度）
-    std::vector<std::pair<float, DocRecord>> scoredDocs;
-    scoredDocs.reserve(ivfTrained_ ? 5000 : 10000);
+    // ---- 3. 只读 id 和向量，算相似度 ----
+    // 用 pair<float, int> 存 (相似度, docId)，不加载整篇内容
+    std::vector<std::pair<float, int>> scoredIds;
+    scoredIds.reserve(ivfTrained_ ? 5000 : 10000);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        DocRecord doc;
-        doc.docId   = sqlite3_column_int(stmt, 0);
-        doc.title   = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        doc.url     = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        doc.content = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        int docId = sqlite3_column_int(stmt, 0);
 
-        // 读出存好的向量（2048 字节 = 512 个 float）
-        const void* blob = sqlite3_column_blob(stmt, 4);
-        int nBytes = sqlite3_column_bytes(stmt, 4);
+        // 读出向量
+        const void* blob = sqlite3_column_blob(stmt, 1);
+        int nBytes = sqlite3_column_bytes(stmt, 1);
         int nFloats = nBytes / static_cast<int>(sizeof(float));
-        doc.embedding.resize(nFloats);
-        if (blob && nFloats > 0) {
-            std::memcpy(doc.embedding.data(), blob, static_cast<size_t>(nBytes));
-        }
 
-        // ---- 3. 算相似度：点积 = 余弦相似度 ----
-        // 因为所有向量都归一化了，直接点积就行
+        // 算点积（余弦相似度）
+        const float* vec = static_cast<const float*>(blob);
         float dot = 0.0f;
-        size_t dim = std::min(queryEmb.size(), doc.embedding.size());
-        for (size_t j = 0; j < dim; ++j) {
-            dot += queryEmb[j] * doc.embedding[j];  // 每个维度乘起来再加
+        int dim = std::min(nFloats, static_cast<int>(queryEmb.size()));
+        for (int j = 0; j < dim; ++j) {
+            dot += queryEmb[j] * vec[j];
         }
 
-        scoredDocs.push_back({dot, std::move(doc)});
+        scoredIds.push_back({dot, docId});
     }
     sqlite3_finalize(stmt);
 
-    if (scoredDocs.empty()) {
+    if (scoredIds.empty()) {
         LOG_WARN("SemanticIndexer: 库里没有文章或堆里没东西，请先跑 buildIndex()");
         return ans;
     }
 
-    // ---- 4. 按相似度从高到低排序 ----
-    // topK == -1 表示返回全部结果；否则只取前 topK 个
-    int nTotal   = static_cast<int>(scoredDocs.size());
-    int nReturn  = (topK < 0 || topK >= nTotal) ? nTotal : topK;
+    // ---- 4. 排序，取前 topK 个 id ----
+    int nTotal  = static_cast<int>(scoredIds.size());
+    int nReturn = (topK < 0 || topK >= nTotal) ? nTotal : topK;
 
     if (nReturn >= nTotal) {
-        // 全部返回 → 全排序
-        std::sort(scoredDocs.begin(), scoredDocs.end(),
-            [](const std::pair<float, DocRecord>& a,
-               const std::pair<float, DocRecord>& b) {
+        std::sort(scoredIds.begin(), scoredIds.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
                 return a.first > b.first;
             });
     } else {
-        // 只取前 topK 个 → partial_sort 更快 O(N log K)
-        std::partial_sort(
-            scoredDocs.begin(),
-            scoredDocs.begin() + nReturn,
-            scoredDocs.end(),
-            [](const std::pair<float, DocRecord>& a,
-               const std::pair<float, DocRecord>& b) {
+        std::partial_sort(scoredIds.begin(), scoredIds.begin() + nReturn,
+            scoredIds.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
                 return a.first > b.first;
             });
     }
 
-    // ---- 5. 组装成 JSON 返回 ----
+    // ---- 5. 第二阶段 SQL：只取前 topK 篇的完整数据 (title, url, content) ----
+    // 避免加载所有候选文档的大段 content
+    std::string phase2SQL = "SELECT id, title, url, content FROM docs"
+                            " WHERE id IN (";
     for (int i = 0; i < nReturn; ++i) {
-        const auto& doc = scoredDocs[i].second;
+        if (i > 0) phase2SQL += ",";
+        phase2SQL += std::to_string(scoredIds[i].second);
+    }
+    phase2SQL += ");";
+
+    sqlite3_stmt* stmt2 = nullptr;
+    if (sqlite3_prepare_v2(db_, phase2SQL.c_str(), -1, &stmt2, nullptr) != SQLITE_OK) {
+        LOG_ERROR("SemanticIndexer: 第二阶段 SQL 查询失败: %s", sqlite3_errmsg(db_));
+        return ans;
+    }
+
+    // 用 map 按 id 索引，方便按 scoredIds 顺序组装
+    std::unordered_map<int, std::tuple<std::string, std::string, std::string>> docMap;
+    while (sqlite3_step(stmt2) == SQLITE_ROW) {
+        int id = sqlite3_column_int(stmt2, 0);
+        std::string t = reinterpret_cast<const char*>(sqlite3_column_text(stmt2, 1));
+        std::string u = reinterpret_cast<const char*>(sqlite3_column_text(stmt2, 2));
+        std::string c = reinterpret_cast<const char*>(sqlite3_column_text(stmt2, 3));
+        docMap[id] = {std::move(t), std::move(u), std::move(c)};
+    }
+    sqlite3_finalize(stmt2);
+
+    // ---- 6. 按相似度顺序组装 JSON ----
+    for (int i = 0; i < nReturn; ++i) {
+        int docId = scoredIds[i].second;
+        auto it = docMap.find(docId);
+        if (it == docMap.end()) {
+            LOG_WARN("SemanticIndexer: docId=%d 在第二阶段查询中未找到", docId);
+            continue;
+        }
+        const auto& [title, url, content] = it->second;
         json item;
-        item["title"]      = doc.title;
-        item["url"]        = doc.url;
-        item["content"]    = doc.content;
-        item["similarity"] = scoredDocs[i].first;  // 相似度分数
-        item["docId"]      = doc.docId;
+        item["title"]      = title;
+        item["url"]        = url;
+        item["content"]    = content;
+        item["similarity"] = scoredIds[i].first;
+        item["docId"]      = docId;
         ans.push_back(std::move(item));
     }
 
     LOG_INFO("SemanticIndexer: 搜索 '%s' 返回 %d 条结果 (topK=%d, 模式=%s)，最像的分数=%f",
              query.c_str(), nReturn, topK,
              ivfTrained_ ? "IVF加速" : "全表扫描",
-             nReturn > 0 ? scoredDocs[0].first : 0.0);
+             nReturn > 0 ? scoredIds[0].first : 0.0);
 
     // ---- 6. 把结果写入 LFU 缓存，下次同样的查询直接秒回 ----
     searchCache_.put(query, ans);
@@ -628,7 +651,7 @@ json SemanticIndexer::find(const string& query, int topK) {
 // 词语推荐（基于 BERT 语义相似度 + ANN 最近邻）
 // ============================================================
 // 算法说明：
-//   1. BERT 编码查询 → 查询向量（512维，L2归一化）
+//   1. BERT 编码查询 → 查询向量（768维，L2归一化）
 //   2. SQLite 全表扫描 → 对每个文档的内容嵌入做点积（余弦相似度）
 //      → 这就是 ANN（近似最近邻）搜索
 //   3. 取 topN（N=50）个最相似文档
@@ -766,25 +789,54 @@ json SemanticIndexer::suggest(const string& query, int topK) {
     } else {
         LOG_INFO("SemanticIndexer::suggest: BGE 查询编码完成, dim=%zu", queryEmb.size());
 
-        // ---- ANN 搜索：全表扫描 + 点积 ----
+        // ---- ANN 搜索：IVF 加速（优先）+ 两阶段查询 ----
+        // 第一阶段：只查 id + title_embedding，不加载 title 字符串（节省 I/O）
         constexpr int ANN_TOP_N = 50;
-        const char* sql = "SELECT title, title_embedding FROM docs WHERE title_embedding IS NOT NULL;";
         sqlite3_stmt* stmt = nullptr;
+        std::string phase1SQL;
+
+        if (ivfTrained_) {
+            // 【IVF 加速】找最近的 nprobe 个堆，只看堆里的文档
+            // 使用 ivfNprobe_ * 2 以覆盖更多候选（suggest 对召回率要求更高）
+            auto nearestClusters = ivfIndex_.searchCentroids(queryEmb.data(), ivfNprobe_ * 2);
+
+            if (nearestClusters.empty()) {
+                LOG_ERROR("SemanticIndexer::suggest: IVF 搜索没找到任何堆");
+                return ans;
+            }
+
+            std::string clusterList;
+            for (size_t i = 0; i < nearestClusters.size(); ++i) {
+                if (i > 0) clusterList += ",";
+                clusterList += std::to_string(nearestClusters[i].first);
+            }
+
+            phase1SQL = "SELECT id, title_embedding FROM docs"
+                        " WHERE cluster_id IN (" + clusterList + ")"
+                        "   AND title_embedding IS NOT NULL;";
+
+            LOG_INFO("SemanticIndexer::suggest: IVF 加速，只看 %zu 个堆 (%s)",
+                     nearestClusters.size(), clusterList.c_str());
+        } else {
+            // 【全表扫描】没有 IVF 索引，所有文档都看一遍
+            phase1SQL = "SELECT id, title_embedding FROM docs"
+                        " WHERE title_embedding IS NOT NULL;";
+            LOG_INFO("SemanticIndexer::suggest: 全表扫描模式（没有 IVF 索引）");
+        }
+
         bool annOk = true;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, phase1SQL.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
             LOG_ERROR("SemanticIndexer::suggest: ANN 查询失败: %s", sqlite3_errmsg(db_));
             annOk = false;
         }
 
-        std::vector<std::pair<float, string>> scoredTitles;
+        // ---- 第一阶段评分：只算 id + title_embedding 的点积 ----
+        std::vector<std::pair<float, int>> scoredIds;   // (点积, docId)
         if (annOk) {
             int rowCount = 0;
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 rowCount++;
-                const char* title = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                if (!title) continue;
-                string titleStr(title);
-                if (titleStr.empty()) continue;
+                int docId = sqlite3_column_int(stmt, 0);
 
                 const void* blob = sqlite3_column_blob(stmt, 1);
                 int nBytes = sqlite3_column_bytes(stmt, 1);
@@ -797,33 +849,66 @@ json SemanticIndexer::suggest(const string& query, int topK) {
                 for (size_t j = 0; j < dim; ++j) {
                     dot += queryEmb[j] * embData[j];
                 }
-                scoredTitles.push_back({dot, std::move(titleStr)});
+                scoredIds.push_back({dot, docId});
             }
             sqlite3_finalize(stmt);
             LOG_INFO("SemanticIndexer::suggest: BGE ANN 扫描 %d 行", rowCount);
 
-            if (scoredTitles.empty()) {
+            if (scoredIds.empty()) {
                 LOG_WARN("SemanticIndexer::suggest: BGE ANN 无有效评分结果");
             }
         }
 
-        // ---- 按语义得分排序，取 topN ----
-        if (!scoredTitles.empty()) {
-            std::partial_sort(scoredTitles.begin(),
-                              scoredTitles.begin() + std::min(ANN_TOP_N, (int)scoredTitles.size()),
-                              scoredTitles.end(),
-                              [](const std::pair<float, string>& a, const std::pair<float, string>& b) {
+        // ---- 排序，取前 ANN_TOP_N 个 docId ----
+        std::vector<std::pair<float, string>> scoredTitles;
+        if (!scoredIds.empty()) {
+            int nSort = std::min(ANN_TOP_N, (int)scoredIds.size());
+            std::partial_sort(scoredIds.begin(),
+                              scoredIds.begin() + nSort,
+                              scoredIds.end(),
+                              [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
                                   return a.first > b.first;
                               });
 
-            int topN = std::min(ANN_TOP_N, (int)scoredTitles.size());
             LOG_INFO("SemanticIndexer::suggest: BGE top%d 最高分=%f, 最低分=%f",
-                     topN, scoredTitles[0].first, scoredTitles[topN-1].first);
+                     nSort, scoredIds[0].first, scoredIds[nSort-1].first);
 
-            // ---- 从 topN 标题中提取词语，按语义得分加权 ----
+            // ---- 第二阶段：只取前 ANN_TOP_N 篇的 title ----
+            // 避免加载所有候选文档的 title 字符串
+            std::string phase2SQL = "SELECT id, title FROM docs WHERE id IN (";
+            for (int i = 0; i < nSort; ++i) {
+                if (i > 0) phase2SQL += ",";
+                phase2SQL += std::to_string(scoredIds[i].second);
+            }
+            phase2SQL += ");";
+
+            sqlite3_stmt* stmt2 = nullptr;
+            if (sqlite3_prepare_v2(db_, phase2SQL.c_str(), -1, &stmt2, nullptr) == SQLITE_OK) {
+                std::unordered_map<int, std::string> titleMap;
+                while (sqlite3_step(stmt2) == SQLITE_ROW) {
+                    int id = sqlite3_column_int(stmt2, 0);
+                    const char* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt2, 1));
+                    if (t) titleMap[id] = t;
+                }
+                sqlite3_finalize(stmt2);
+
+                // 按 scoredIds 顺序组装 (score, title)
+                for (int i = 0; i < nSort; ++i) {
+                    auto it = titleMap.find(scoredIds[i].second);
+                    if (it != titleMap.end() && !it->second.empty()) {
+                        scoredTitles.push_back({scoredIds[i].first, it->second});
+                    }
+                }
+                LOG_INFO("SemanticIndexer::suggest: 第二阶段获取到 %zu 个标题", scoredTitles.size());
+            } else {
+                LOG_ERROR("SemanticIndexer::suggest: 第二阶段查询失败: %s", sqlite3_errmsg(db_));
+            }
+        }
+
+        // ---- 从 topN 标题中提取词语，按语义得分加权 ----
+        if (!scoredTitles.empty()) {
             std::unordered_map<string, std::pair<float, int>> bgeWordStats;
-            for (int i = 0; i < topN; ++i) {
-                const auto& scored = scoredTitles[i];
+            for (const auto& scored : scoredTitles) {
                 float docScore = scored.first;
                 std::vector<std::string> extracted = _suggest_extractWords(scored.second);
 

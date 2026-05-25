@@ -46,6 +46,16 @@ BertInferEngine::BertInferEngine(const std::string& model_path, const std::strin
         api_->SetSessionGraphOptimizationLevel(sess_opts_raw, ORT_ENABLE_ALL),
         "设置图优化级别失败");
 
+    // 设置线程数：当前 2 核 CPU，intra_op=2 充分利用并行计算
+    // intra_op 控制单个算子（如矩阵乘法）内部的线程数
+    // inter_op 控制不同算子之间的并行（顺序依赖的算子无法并行）
+    check_status(
+        api_->SetIntraOpNumThreads(sess_opts_raw, 2),
+        "设置 intra_op_num_threads 失败");
+    check_status(
+        api_->SetInterOpNumThreads(sess_opts_raw, 1),
+        "设置 inter_op_num_threads 失败");
+
     // ---- 4. 创建 CPU MemoryInfo（用于创建输入张量） ----
     OrtMemoryInfo* mem_info_raw = nullptr;
     check_status(
@@ -184,11 +194,12 @@ std::vector<float> BertInferEngine::encode_single(const std::string& text) {
         "获取输出数据失败");
 
     // ---- 7. Mean Pooling（加权平均，排除 padding） ----
+    // 优化：只循环 actual_len 而非 BERT_MAX_SEQ_LEN
+    // 对短查询（如 "癌症" = 2 tokens），可减少 96% 的循环次数
     std::vector<float> embedding(BERT_HIDDEN_SIZE, 0.0f);
     float weight_sum = 0.0f;
 
-    for (size_t i = 0; i < BERT_MAX_SEQ_LEN; ++i) {
-        if (attn_mask_buf_[i] == 0) continue;  // 跳过 padding
+    for (size_t i = 0; i < actual_len; ++i) {
         weight_sum += 1.0f;
         for (size_t j = 0; j < BERT_HIDDEN_SIZE; ++j) {
             embedding[j] += output_data[i * BERT_HIDDEN_SIZE + j];

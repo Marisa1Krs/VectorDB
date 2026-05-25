@@ -54,7 +54,7 @@
     "clean_text": true,
     "handle_chinese_chars": true,
     "strip_accents": null,
-    "lowercase": false
+    "lowercase": true
   },
   "pre_tokenizer": {
     "type": "BertPreTokenizer"
